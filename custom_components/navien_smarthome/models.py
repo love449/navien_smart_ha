@@ -11,22 +11,20 @@
 from __future__ import annotations
 
 import time
-from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Any
 
 from .const import (
     CAPACITY_DOUBLE,
-    CELSIUS_STEPS,
     MAT_ERROR_NAMES,
     MAT_VOLUME_NAMES,
     MODE_HEAT,
     MODE_NAMES,
-    MODE_POWER_OFF,
     MODES_ON,
     SEASON_NAMES,
     SEASON_SUMMER,
     SERVICE_NAMES,
+    UNIT_CELSIUS,
     UNIT_LEVEL,
     ZONE_LEFT,
     ZONE_RIGHT,
@@ -93,7 +91,7 @@ class HeatControl:
 
     @property
     def is_celsius(self) -> bool:
-        return self.unit in CELSIUS_STEPS
+        return self.unit == UNIT_CELSIUS
 
     @property
     def is_known(self) -> bool:
@@ -103,37 +101,8 @@ class HeatControl:
     def step(self) -> float:
         """`<간격><축>` 인코딩의 앞쪽 숫자."""
         if self.is_celsius:
-            return CELSIUS_STEPS[self.unit]
+            return 0.5
         return 1.0
-
-    @property
-    def off_value(self) -> float | None:
-        """구역 하나를 끌 때 보내는 값. **`rangeMin` 보다 한 칸 아래다.**
-
-        앱 원본 (`MateWifiModelControlViewModel.setTemperature`)
-
-            if (temp <= rangeMin - 1) temp = 0;      // 내부 표시용
-            ...
-            if (temp < rangeMin) temp = rangeMin - controlUnit;   // 실제 전송값
-
-        **0 을 보내는 게 아니다.** 0 은 앱이 화면에 「꺼짐」을 그리려고 쓰는 중간
-        값이고, 기기로 나가는 것은 `rangeMin - 간격` 이다.
-
-            단계형 1.0L (1~8)    1 - 1.0  = 0      ← 실측 검증됨
-            온도형 0.5C (28~50)  28 - 0.5 = 27.5
-            온수형 1.0C (28~45)  28 - 1.0 = 27.0
-
-        **단계형이 지금까지 맞았던 이유가 이것이다.** `level 0` 을 보내고 있었는데
-        그게 우연이 아니라 같은 규칙의 결과였다. 온도형만 이 계산을 안 하고
-        `enable: false` 만 보내서 기기가 무시했다 (이슈 #16).
-
-        `enable` 은 앱이 **구역을 끌 때 손대지 않는다** — `updateLeftMatSettingTemp`
-        가 `temperature.setSet()` 만 부른다. 우리는 단계형에서 함께 보내 검증된
-        형태라 그대로 두되, 값이 본체다.
-        """
-        if self.range_min is None or not self.is_known:
-            return None
-        return self.range_min - self.step
 
     @classmethod
     def parse(cls, raw: Any) -> HeatControl | None:
@@ -549,170 +518,6 @@ class NavienDevice:
         if isinstance(temperature, dict) and temperature.get("set") is not None:
             return float(temperature["set"])
         return None
-
-    def zone_is_off(self, zone: str) -> bool | None:
-        """이 구역이 꺼져 있나. **모르면 `None`** — 껐다고 단정하지 않는다.
-
-        **`enable` 을 먼저 본다. 앱이 그렇게 한다.**
-
-        `MateInfoData.setHeatType()` 은 켜짐/꺼짐을 오직 `enable` 로 가른다.
-
-            if (left.enable == TRUE  && right.enable == TRUE)  heatType = 4;
-            if (left.enable == TRUE  && right.enable == FALSE) heatType = 2;
-            if (left.enable == FALSE && right.enable == TRUE)  heatType = 3;
-            else                                              heatType = 1;
-
-        `setMatLeftTemp()` 는 한 걸음 더 간다 — **꺼져 있으면 기기가 보낸 온도를
-        버리고 0 으로 덮는다.**
-
-            if (leftMatEnable) leftMatSettingTemp = set;
-            else               leftMatSettingTemp = 0;      // 화면에 「꺼짐」
-
-        그 분기가 있다는 것은 **꺼진 구역이 정상 온도를 보고할 수 있다**는 뜻이다.
-        그래서 앱은 꺼짐 판단에 온도를 쓰지 않는다.
-
-        v0.17.1 까지 우리는 온도로 판단했다. 같은 것을 `hvac_mode` 는 `enable` 로,
-        여기서는 온도로 봐서 **두 곳이 어긋나 있었다.** 앱 기준으로 맞춘다.
-
-        **다만 `enable` 은 기기 전원이 켜져 있을 때만 쓴다.**
-
-        `enable` 이 뜻하는 것은 「이 구역이 꺼진 상태로 설정됐는가」가 아니라
-        **「지금 난방 중인가」**다. 전원을 끄면 맞춰둔 값과 무관하게 전부 `false`
-        가 된다 — 이슈 #19 제보자의 상태 기록에 그대로 찍혔다.
-
-            opMode 1   left {28.0, enable T}   right {27.5, enable F}
-            opMode 0   left {28.0, enable F}   right {27.5, enable F}   ← 전원 끔
-            opMode 1   left {28.0, enable F}   right {28.0, enable F}   ← 켠 직후
-            opMode 1   left {28.0, enable T}   right {28.0, enable T}   ← 1.3초 뒤
-
-        v0.17.2 는 이것을 안 가려서, 전원이 꺼져 있으면 **33도로 맞춰둔 구역까지
-        「꺼짐」으로 읽고** 켤 때 최저값으로 되돌렸다. 전원이 꺼져 있을 때는
-        값으로 판단해야 사용자가 맞춰둔 설정이 살아남는다.
-
-        `enable` 이 안 와도 값으로 판단한다 — 단계형은 `level 0` 과 `enable false`
-        가 함께 움직이므로 어느 쪽으로 봐도 답이 같다(실기기 확인).
-        """
-        if self.is_on:
-            enabled = self.zone_enabled(zone)
-            if enabled is not None:
-                return not enabled
-        control = self.active_control
-        if control is None:
-            return None
-        off = control.off_value
-        setting = self.zone_setting(zone)
-        if off is None or setting is None:
-            return None
-        return setting <= off
-
-    def build_zone_off(self, zones: Iterable[str]) -> dict[str, Any]:
-        """구역을 끄는 desired 를 만든다.
-
-        **`enable: false` 만 보내면 기기가 무시한다** (이슈 #16, EME-520 에서 세 번
-        보내 세 번 무시됨). 값을 `off_value` 로 내려야 실제로 꺼진다.
-
-        **마지막 남은 구역은 끌 수 없다.** 기기가 막는다. 사장님 단계형 매트에서
-        실기기로 확인했다 — 좌측이 0 인 상태에서 우측을 0 으로 내리면 명령이 안
-        먹고 `0, 1` 로 남는다.
-
-        **좌우 분리 매트는 전원을 대신 꺼주지 않는다.** 앱도 그렇게 하지 않는다 —
-        막고 알린다.
-
-            if (heatType != 2 && heatType != 1) return true;   // 진행
-            CustomToast.show(mate_dual_temp_batch_control_one_side_off);
-            return false;                                       // 막는다
-
-        전원을 다시 켜면 양쪽이 다 켜진다(이슈 #19 실측). 마지막 한쪽을 끄면서
-        전원을 끄면 「한쪽만 쓰던 구성」이 다음에 켤 때 사라진다.
-
-        **싱글 매트는 전원을 끈다** (v0.21.0). 구역이 하나라 사라질 구성이 없고,
-        막으면 온도조절기의 「꺼짐」· 음성 비서의 「꺼줘」· 자동화의 끄기가 **항상
-        실패한다** — 셋 다 이 길로 온다. 앱과 다르지만, 앱은 같은 화면에 전원
-        버튼이 있고 HA 카드에는 없다.
-        """
-        control = self.active_control
-        if control is None or not control.is_known:
-            raise ValueError(
-                f"제어 축을 모르는 기기입니다 (unit={control.unit if control else None})"
-            )
-        off = control.off_value
-        if off is None:
-            raise ValueError("이 기기의 꺼짐 값을 계산할 수 없습니다 (rangeMin 없음)")
-
-        target = set(zones)
-        # 이번에 끄지 않는 구역 중 **켜져 있다고 확인된 것**이 하나라도 있나.
-        # 모르면(`None`) 켜져 있는 쪽으로 본다 — 막아서 못 쓰게 하는 것보다
-        # 보내보고 기기 판단에 맡기는 편이 낫다.
-        stays_on = any(
-            self.zone_is_off(zone) is not True
-            for zone in self.zones
-            if zone not in target
-        )
-        if not stays_on:
-            if len(self.zones) == 1:
-                return {"operationMode": MODE_POWER_OFF}
-            # 앱 문구 그대로 (`strings.xml`).
-            raise ValueError(
-                "이미 다른 편측이 운전대기 상태입니다. "
-                "난방을 끄시려면 매트 전원을 종료해 주세요."
-            )
-
-        heater = self.build_heater_desired(
-            changes={zone: off for zone in target},
-            enables={zone: False for zone in target},
-        )
-        return {"heater": heater}
-
-    def build_zone_on(self, zones: Iterable[str]) -> dict[str, Any]:
-        """구역을 켜는 desired 전체를 만든다.
-
-        **끄는 쪽과 정확히 대칭이다.** 끌 때 값을 안 내려서 안 꺼졌던 것처럼,
-        켤 때 값을 안 올리면 안 켜진다 (이슈 #16, 제보자 7번).
-
-            보내던 것:  operationMode 1 + 온도 27.5   → 전원만 켜지고 구역은 꺼진 채
-            보내야 할 것: operationMode 1 + 온도 28     → 실제로 켜진다
-
-        `27.5` 는 그 구역이 꺼져 있다는 뜻이므로, 그대로 다시 보내면 「꺼진 채로
-        있어라」가 된다. 앱에서 꺼짐 상태에서 `+` 를 누르면 `rangeMin` 이 되는
-        것과 같게 맞춘다.
-
-        **꺼져 있지 않은 구역은 값을 건드리지 않는다.** 사용자가 33도로 맞춰둔
-        구역을 켠다고 28도로 되돌리면 안 된다.
-        """
-        control = self.active_control
-        if control is None or not control.is_known:
-            raise ValueError(
-                f"제어 축을 모르는 기기입니다 (unit={control.unit if control else None})"
-            )
-        target = set(zones)
-        changes: dict[str, float] = {}
-        floor = control.range_min
-        # **기기가 아직 아무 상태도 안 보냈으면 여기서 값을 지어내지 않는다.**
-        # `build_heater_desired` 가 「전원 스위치로는 켤 수 있습니다」 안내를
-        # 띄우게 그대로 둔다 — 그 편이 사용자가 할 수 있는 것을 알려준다.
-        reported_heater = self.reported.get("heater")
-        known = reported_heater if isinstance(reported_heater, dict) else {}
-        if floor is not None:
-            for zone in target:
-                if zone not in known:
-                    continue
-                # **켜라고 한 구역은 반드시 명령에 넣는다.**
-                #
-                # `build_heater_desired` 는 값을 모르는 구역을 통째로 건너뛴다.
-                # 그래서 기기가 그 구역 온도를 안 보내주면 「켜줘」를 눌러도
-                # 명령에 그 구역이 없고, 전원만 켜진 채 구역은 그대로 남았다
-                # (이슈 #16 의 7번 후보). 켜라는 지시를 받았으면 최저값이라도
-                # 실어 보내는 것이 맞다.
-                #
-                # **켜져 있다고 확인된 구역만 값을 안 건드린다** — 33도로
-                # 맞춰둔 쪽을 28로 되돌리면 안 된다.
-                if self.zone_is_off(zone) is not False:
-                    changes[zone] = floor
-        heater = self.build_heater_desired(
-            changes=changes,
-            enables={zone: True for zone in target},
-        )
-        return {"operationMode": MODE_HEAT, "heater": heater}
 
     def zone_current(self, zone: str) -> float | None:
         """현재값. 온도형만 온다. 단계형은 `None`."""

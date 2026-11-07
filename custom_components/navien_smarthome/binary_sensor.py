@@ -11,8 +11,9 @@ from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
 from . import NavienSmartConfigEntry
 from .airone import AironeDevice
+from .boiler import BoilerDevice
 from .coordinator import NavienSmartCoordinator
-from .entity import AironeEntity, NavienSmartEntity
+from .entity import AironeEntity, BoilerEntity, NavienSmartEntity
 from .models import NavienDevice
 
 
@@ -32,6 +33,9 @@ async def async_setup_entry(
     entities.extend(
         AironeErrorProblem(coordinator, airone) for airone in coordinator.airone.values()
     )
+    for boiler in coordinator.boiler.values():
+        entities.append(BoilerRunning(coordinator, boiler))
+        entities.append(BoilerErrorProblem(coordinator, boiler))
     async_add_entities(entities)
 
 
@@ -77,6 +81,49 @@ class NavienSmartErrorProblem(NavienSmartEntity, BinarySensorEntity):
         if device is None or device.error_code is None:
             return None
         return device.error_code != 0
+
+
+class BoilerRunning(BoilerEntity, BinarySensorEntity):
+    """지금 실제로 연소 중인가 (`operationBusy`).
+
+    **모드가 켜져 있는 것과 다르다.** 설정 온도에 도달하면 모드는 그대로여도
+    연소는 멈춘다. 실측으로 확인했다 — 온돌난방을 켜자 1→2 로 바뀌며 공급수
+    온도가 31.5→44°C 로 올랐고, 끄자 2→1 로 돌아왔다.
+    """
+
+    _attr_name = "가동중"
+    _attr_device_class = BinarySensorDeviceClass.RUNNING
+    _attr_icon = "mdi:fire"
+
+    def __init__(self, coordinator: NavienSmartCoordinator, device: BoilerDevice) -> None:
+        super().__init__(coordinator, device)
+        self._attr_unique_id = f"{device.device_id}_running"
+
+    @property
+    def is_on(self) -> bool | None:
+        device = self.device
+        if device is None or not device.has_status:
+            return None
+        return device.is_running
+
+
+class BoilerErrorProblem(BoilerEntity, BinarySensorEntity):
+    """`errorCode` 가 0 이 아니면 문제. `faultStatus` 도 함께 본다."""
+
+    _attr_name = "오류"
+    _attr_device_class = BinarySensorDeviceClass.PROBLEM
+
+    def __init__(self, coordinator: NavienSmartCoordinator, device: BoilerDevice) -> None:
+        super().__init__(coordinator, device)
+        self._attr_unique_id = f"{device.device_id}_problem"
+
+    @property
+    def is_on(self) -> bool | None:
+        device = self.device
+        if device is None or not device.has_status:
+            return None
+        code = device.error_code
+        return None if code is None else code != 0
 
 
 class AironeErrorProblem(AironeEntity, BinarySensorEntity):

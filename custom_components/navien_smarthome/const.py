@@ -89,85 +89,17 @@ SERVICE_NAMES: Final = {
 
 # MQTT 구독 토픽 접두사. 앱의 `HomeViewModel` 이 `/{접두사}/#` 로 구독한다 —
 # `smarttok`(보일러) `mate` `airone` `scada` `homeauto` 다섯 개가 전부다.
-# 매트는 실측 확인됨. 보일러는 여기 넣지 않는다 — 형식을 아는 modelCode 가
-# 있을 때만 `BOILER_PREFIX` 를 따로 붙인다.
+# 매트는 실측 확인됨. 보일러는 지원하지 않으므로 넣지 않는다.
 #
 # 에어원 **제어**는 이 체계가 아니라 `AIRONE_TOPIC_FMT` 를 쓴다. 구독만 여기다.
-TOPIC_PREFIX: Final = {SERVICE_MATE: "mate", SERVICE_AIRONE: "airone"}
-
-# --- 보일러 상태 수집 -----------------------------------------------------
 #
-# v0.20.0 부터 응답이 우리에게 오는지, 어떤 모양인지를 진단 파일에 담아 왔다.
-# v0.22.0 부터 그 응답으로 엔티티를 만든다 (베타) — 아래 「보일러 베타」 참조.
-# 처음 받은 것을 진단에 남기는 기록은 그대로 둔다.
-#
-# 앱이 보일러 화면을 열 때와 같은 **읽기 요청 두 개**를 보낸다 — 기능 목록
-# (`status/start`), 현재 상태(`status`). 설정은 바뀌지 않는다. 형식은 APK 로
-# 확인했다 (`BoilerConstants.boilerMqttPayload`, `HomeViewModel.getDeviceStart`).
-#
-# 봉투는 modelCode 로만 갈린다. 각방 Hi(120)와 도트(001)는 모양이 달라 묻지 않는다.
-# NRM-35D 각방(011)은 묻는다 (v0.21.4) — 앱이 NR-35/40D 와 **같은 봉투**로 상태를
-# 묻는다 (`boilerNR35SeriesMqttPayload`). 방 비트문자열은 제어 때만 붙는다. 응답의
-# `status` 는 방마다 하나씩 든 목록이다 (`GetStatusDataNRM35`).
-BOILER_PREFIX: Final = "smarttok"
-BOILER_MGPP_MODELS: Final = frozenset({"20"})  # NR-6x — protocolVersion·command·deviceType 실림
-BOILER_NR35_MODELS: Final = frozenset({"002", "003", "011"})  # NR-35/40D · NRM-35D — 그 셋이 없다
-# (요청, 응답, command)
-BOILER_REQ_START: Final = ("status/start", "res/start", 16777217)
-BOILER_REQ_STATUS: Final = ("status", "res", 16777219)
-# 앱은 start 응답(기능 목록)을 받은 뒤 status 를 보낸다. 우리는 응답을 기다리지
-# 않고 이만큼 쉰 뒤 보낸다 — 응답이 안 오는 경우도 기록해야 하기 때문이다.
-BOILER_STATUS_DELAY_SECONDS: Final = 8
-# 기기당 남길 수신 메시지 수. 요청 응답 두 개 뒤에도 기기가 스스로 올리는지
-# 보려면 몇 개 더 남아야 한다.
-BOILER_KEEP_MESSAGES: Final = 10
-# **처음 받은 것은 따로 둔다** (v0.21.2). 기능 목록·상태 응답이 뒤에 오는 메시지에
-# 밀려나면 형식 판단 근거가 사라진다. 그 뒤로 오는 것은 요청하지 않은 것이므로
-# 「기기가 스스로 올리는가」를 그대로 보여준다.
-BOILER_KEEP_FIRST: Final = 5
-
-# --- 보일러 베타 (v0.22.0) ------------------------------------------------
-#
-# **상태는 모두에게, 제어는 확인된 기종(NR-6x)에게.** 상태 형식은 실기기 응답으로
-# 확인했다 (#20 #26 NR-6x · #24 NR-40D · #28 NRM-35D). 제어는 v0.22.0~v0.23.0 에
-# 실험(기본 꺼짐)으로 냈고, NR-6x 두 대에서 모두 확인돼 v0.24.0 부터 기본 켜짐이다.
-# 설정에서 끌 수 있다.
-CONF_BOILER_CONTROL: Final = "boiler_control"
-# 제어를 열어 두는 modelCode. NR-6x 만 — 보일러가 바뀐 상태를 스스로 알려 주는
-# 것까지 확인된 계열이다 (#20, 실내조절기 조작이 수 초 안에 방송됨).
-# NR-40D·NRM-35D 는 명령 모양이 달라(각방은 방 비트문자열) 제보자 확인 뒤에 연다.
-BOILER_CONTROL_MODELS: Final = frozenset({"20"})
-# 이 시간 동안 보일러에게서 아무 메시지도 없으면 상태를 한 번 묻는다. 상태가
-# 바뀌면 보일러가 알아서 보내므로(#20) 평소에는 묻지 않는다. 매트 폴링 주기와 같다.
-BOILER_STALE_SECONDS: Final = 900
-# 기능 목록이 처음 들어온 보일러를 플랫폼에 알린다. 엔티티는 MQTT 가 붙기 전에
-# 만들어지므로, 무엇을 지원하는지 알게 된 뒤에 더한다. `{entry_id}` 로 갈린다.
-SIGNAL_BOILER_READY: Final = "navien_smarthome_boiler_ready_{}"
-
-# `operationMode` (앱 `SmartTokControlFragment`). 4 는 NR-6x 에서 온수전용·외출을
-# 함께 뜻한다(앱 코드). 모르는 값은 `알 수 없음(N)` 으로 둔다.
-BOILER_MODE_OFF: Final = 1
-BOILER_MODE_GOOUT: Final = 4
-BOILER_MODE_INSIDE: Final = 5
-BOILER_MODE_ONDOL: Final = 6
-BOILER_MODE_NAMES: Final = {
-    1: "꺼짐",
-    4: "외출",
-    5: "실내난방",
-    6: "온돌난방",
-    7: "반복예약",
-    8: "24시간예약",
-    10: "온수전용",
+# 보일러(smarttok)를 넣었다 — **관찰 전용이다.** 파싱도 제어도 하지 않고
+# raw 페이로드를 로그로만 남긴다 (NR-65D 지원 준비, mqtt.py 의 BOILER_PREFIX 참조).
+TOPIC_PREFIX: Final = {
+    SERVICE_MATE: "mate",
+    SERVICE_AIRONE: "airone",
+    SERVICE_BOILER: "smarttok",
 }
-
-# 제어 (요청 이름 `control`, 응답 `res`). (mode, command) — 앱 `ControlRequestMode`
-# 와 `DeviceControlViewFragment` 의 `boilerControlDevice(...)` 호출에서 옮겼다.
-BOILER_CMD_POWER_ON: Final = ("power-on", 33554434)
-BOILER_CMD_POWER_OFF: Final = ("power-off", 33554433)
-BOILER_CMD_GOOUT: Final = ("goout-on", 33554436)
-BOILER_CMD_INSIDE: Final = ("inside-heat", 33554437)
-BOILER_CMD_ONDOL: Final = ("ondol-heat", 33554438)
-BOILER_CMD_HOTWATER: Final = ("hotwater-temperature", 33554443)
 
 # --- 에어원 (환기청정) ----------------------------------------------------
 #
@@ -228,20 +160,9 @@ AIRONE_RUN_NAMES: Final = {
     AIRONE_RUN_AUTO_DRY: "자동건조",
 }
 
-# 값은 `ROOM_OPERATION_MODE_*` / `OPERATION_MODE_*`.
-#
-# **이름 계열이 앱에 두 벌이다.** 처음에 이걸 몰라서 하나를 섞어 넣었다.
-#
-#   목록용   STR_FRAGMENT_AIRONE_CONTROL_MODE_*_TITLE   환기모드 · 청정모드 · 자동운전
-#            (`AironeModeListAdapter` — 모드 고르는 화면)
-#   표시용   airone_*                                    환기 · 청정 · **자동**
-#            (`AirOneControlFragment` — 제어 화면의 현재 모드)
-#
-# **표시용을 쓴다.** 사용자가 대시보드에서 보는 것이 그 자리다. 그래서 「~모드」
-# 접미사가 없고, 옵션과 붙여도 자연스럽다 (환기 터보 · 청정 절전).
-#
-# `12` 만 목록용(`자동운전`)에서 가져와 계열이 어긋나 있었다. 커뮤니티 제보로
-# 확인하고 `자동` 으로 맞췄다 — 나머지는 처음부터 표시용과 같았다.
+# 값은 `ROOM_OPERATION_MODE_*` / `OPERATION_MODE_*`, 이름은 앱 제어화면 문자열
+# (`STR_FRAGMENT_AIRONE_CONTROL_MODE_*_TITLE`)에서 가져왔다. 「~모드」 접미사는
+# 옵션과 붙일 때 어색해져서 뺀다 (환기모드 · 터보 → 환기 터보).
 #
 # 서버가 주지 않는 모드도 라벨을 둔다. 표시용일 뿐이고 제어는 서버가 알려준
 # 조합에서만 나오므로 위험하지 않다 — 모르는 값이 와도 숫자로 보이지 않는다.
@@ -253,7 +174,7 @@ AIRONE_MODE_NAMES: Final = {
     8: "청정",  # 청정모드
     9: "제습",  # 제습모드
     10: "환기제습",
-    12: "자동",  # airone_auto. 목록용은 `자동운전` 이지만 표시용을 쓴다
+    12: "자동운전",
     15: "환기(외기)",  # OPERATION_MODE_AERATION — 앱 명칭 미확인
     17: "바이패스",
     18: "음압환기",
@@ -613,21 +534,10 @@ def airone_mode_label(mode: int, option: int) -> str:
 
 # --- 제어 축 (heatControl.unit) -------------------------------------------
 
-# `<간격><축>` 형식. dex 에는 앞의 둘만 있었고, `1.0C` 는 서버가 온수매트
-# (EQM-580, 이슈 #25)에 내려준 값이다. 앱은 단위 문자열을 표로 갈라 쓰지 않는다 —
-# 앞 숫자를 떼어 간격으로 쓰고(`MateInfoData` 의 `unit.substring(0, len - 1)`),
-# 단계형인지는 상태에 `level` 이 오는지로 가른다. 그래서 `1.0C` 는 1도 간격
-# 온도형이다. 제보 상태에도 `temperature.set` 이 왔다.
+# dex 전수 검색 결과 값은 이 둘뿐이다. `<간격><축>` 형식.
 UNIT_LEVEL: Final = "1.0L"  # heater.*.level.set — 정수 단계
 UNIT_CELSIUS: Final = "0.5C"  # heater.*.temperature.set — 0.5도 간격
-UNIT_CELSIUS_WHOLE: Final = "1.0C"  # heater.*.temperature.set — 1도 간격
-CELSIUS_STEPS: Final = {UNIT_CELSIUS: 0.5, UNIT_CELSIUS_WHOLE: 1.0}
-KNOWN_UNITS: Final = (UNIT_LEVEL, UNIT_CELSIUS, UNIT_CELSIUS_WHOLE)
-
-# 앱이 「2024년 이후 모델」로 보는 매트 `modelCode` (`MateInfoData.setModelCodeAndFunction`).
-# 앱은 이 모델에 보내는 **모든 제어 명령**에 `beep: true` 를 싣고, 기기는 그때만
-# 조작음을 낸다 (이슈 #23). 구형에는 싣지 않는다 — 앱이 안 싣는 것을 보내지 않는다.
-MODELS_AFTER_2024: Final = frozenset({10, 17, 18, 259, 260, 261, 262, 514, 530})
+KNOWN_UNITS: Final = (UNIT_LEVEL, UNIT_CELSIUS)
 
 # --- operationMode (KDMode.WIFI 맵) ---------------------------------------
 

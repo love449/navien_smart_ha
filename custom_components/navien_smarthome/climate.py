@@ -1,4 +1,4 @@
-"""온도형 매트의 온도조절기 (`heatControl.unit` 이 `0.5C` · `1.0C`).
+"""온도형 매트의 온도조절기 (`heatControl.unit == "0.5C"`).
 
 온도형은 `temperature.current` 를 함께 보내주므로 `climate` 가 맞다 — 서모스탯
 카드의 현재 온도 칸이 채워진다.
@@ -13,37 +13,49 @@
 
 from __future__ import annotations
 
+import logging
+import time
 from typing import Any
 
 from homeassistant.components.climate import (
-    ATTR_HVAC_MODE,
     ClimateEntity,
     ClimateEntityFeature,
     HVACAction,
     HVACMode,
 )
-from homeassistant.const import UnitOfTemperature
-from homeassistant.core import HomeAssistant
-from homeassistant.exceptions import HomeAssistantError
+from homeassistant.components.climate import ATTR_PRESET_MODE
+from homeassistant.const import ATTR_TEMPERATURE, UnitOfTemperature
+from homeassistant.core import CALLBACK_TYPE, HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
+from homeassistant.helpers.event import async_call_later
+from homeassistant.helpers.restore_state import RestoreEntity
+
+from homeassistant.exceptions import HomeAssistantError
 
 from . import NavienSmartConfigEntry
 from .boiler import BoilerDevice
-from .const import (
-    BOILER_CMD_GOOUT,
-    BOILER_CMD_INSIDE,
-    BOILER_CMD_ONDOL,
-    BOILER_CMD_POWER_OFF,
-    BOILER_CMD_POWER_ON,
-    BOILER_MODE_GOOUT,
-    BOILER_MODE_INSIDE,
-    BOILER_MODE_ONDOL,
-    MODE_HEAT,
-    ZONE_NAMES,
-)
+from .const import MODE_HEAT, ZONE_NAMES
 from .coordinator import NavienSmartCoordinator
-from .entity import BoilerEntity, NavienSmartEntity, async_track_boilers
+from .entity import BoilerEntity, NavienSmartEntity
 from .models import NavienDevice
+
+_LOGGER = logging.getLogger(__name__)
+
+# 보일러 운전 preset. **기기가 배타적으로 하나만 켠다** — 외출·실내난방·온돌난방이
+# 겹쳐 동작할 수 없으므로 한 엔티티에서 고르게 한다.
+_PRESET_INSIDE = "실내난방"
+_PRESET_ONDOL = "온돌난방"
+_PRESET_AWAY = "외출(온수전용)"
+
+# 보일러 온도 **연속 입력 묶음** (2026-10-29).
+#
+# 서모스탯 카드의 +/- 를 연달아 누르면 누를 때마다 명령이 하나씩 나가고, 기기
+# 응답이 2~5초씩 늦게 도착해 화면 숫자가 「내렸는데 다시 올라가는」 식으로 출렁였다.
+# 마지막 입력 뒤 `_DEBOUNCE_SECONDS` 동안 추가 입력이 없을 때 **마지막 값 하나만**
+# 보낸다. 보낸 뒤에는 기기가 그 값을 확인해 줄 때까지(최대 `_PENDING_HOLD_SECONDS`)
+# 화면에 누른 값을 유지한다 — 시간이 지나면 기기가 알려준 값으로 돌아간다.
+_DEBOUNCE_SECONDS = 1.5
+_PENDING_HOLD_SECONDS = 15.0
 
 
 async def async_setup_entry(
@@ -60,14 +72,23 @@ async def async_setup_entry(
         entities.extend(
             NavienSmartThermostat(coordinator, device, zone) for zone in device.zones
         )
-    async_add_entities(entities)
-    async_track_boilers(
-        hass,
-        entry,
-        coordinator,
-        lambda b: [BoilerThermostat(coordinator, b)] if coordinator.boiler_controllable(b) else [],
-        async_add_entities,
-    )
+    # 보일러 난방. 실내·온돌 중 **하나라도** 지원하고 범위를 알려준 경우만 만든다.
+    boiler_entities: list[ClimateEntity] = []
+    for boiler in coordinator.boiler.values():
+        if BoilerThermostat.presets_for(boiler):
+            boiler_entities.append(BoilerThermostat(coordinator, boiler))
+    async_add_entities([*entities, *boiler_entities])
+
+
+def _raise_if_failed(outcome: dict[str, Any], prefix: str) -> None:
+    """보내지 못한 기기가 있으면 이유를 담아 올린다."""
+    reasons = [
+        str(item.get("reason"))
+        for item in outcome.get("results") or []
+        if not item.get("sent")
+    ]
+    if reasons:
+        raise HomeAssistantError(f"{prefix}: {'; '.join(reasons)}")
 
 
 class NavienSmartThermostat(NavienSmartEntity, ClimateEntity):
@@ -236,22 +257,9 @@ class NavienSmartThermostat(NavienSmartEntity, ClimateEntity):
             changes={zone: value for zone in zones},
             enables={zone: True for zone in zones},
         )
-        desired: dict[str, Any] = {"heater": heater}
-        # **꺼져 있으면 온도만 저장한다** (v0.21.0). 앱 홈 카드가 그렇게 보낸다 —
-        # `control-temp` 에 `operationMode` 가 없다. 기기는 그 값을 들고 있다가
-        # 켤 때 그 온도로 시작한다 (EQM-580 제보자 실기기 확인). 단계형도 같다.
-        #
-        # 켜려면 HA 규칙대로 `hvac_mode` 를 함께 준다. 상태를 아직 모르면 예전처럼
-        # 켜는 쪽으로 보낸다 — 켜져 있을 때 검증된 형태다.
-        hvac_mode = kwargs.get(ATTR_HVAC_MODE)
-        if hvac_mode is None:
-            if device.operation_mode is None or device.is_on:
-                desired["operationMode"] = MODE_HEAT
-        elif hvac_mode != HVACMode.OFF:
-            desired["operationMode"] = MODE_HEAT
-        await self.coordinator.async_send(device, desired)
-        if hvac_mode == HVACMode.OFF:
-            await self.async_set_hvac_mode(HVACMode.OFF)
+        await self.coordinator.async_send(
+            device, {"operationMode": MODE_HEAT, "heater": heater}
+        )
 
     async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
         device = self.device
@@ -259,184 +267,405 @@ class NavienSmartThermostat(NavienSmartEntity, ClimateEntity):
             return
         zones = self._target_zones
         if hvac_mode is not HVACMode.OFF:
-            # 난방이든 냉방이든 켜는 방법은 같다. 난방·냉방을 가르는 것은 `season`
-            # 이고 그건 앱에서 고른다.
-            #
-            # **꺼져 있던 구역은 값도 함께 올려야 한다** (이슈 #16). 예전에는
-            # `enable: true` 만 보내고 온도는 27.5(=꺼짐) 그대로 다시 보내서,
-            # 기기 전원만 켜지고 그 구역은 꺼진 채로 남았다.
-            await self.coordinator.async_send(device, device.build_zone_on(zones))
+            # 난방이든 냉방이든 켜는 방법은 같다 — `operationMode` 1 + 구역 `enable`.
+            # 난방·냉방을 가르는 것은 `season` 이고 그건 앱에서 고른다.
+            heater = device.build_heater_desired(
+                enables={zone: True for zone in zones}
+            )
+            await self.coordinator.async_send(
+                device, {"operationMode": MODE_HEAT, "heater": heater}
+            )
             return
-        # **`enable: false` 만으로는 안 꺼진다** (이슈 #16). 값을 `off_value` 까지
-        # 내려야 기기가 받는다. 남는 구역이 없으면 싱글은 전원을 끄고 좌우 분리는
-        # 막는다 — 판단은 `build_zone_off` 안에 있다.
-        await self.coordinator.async_send(device, device.build_zone_off(zones))
+        # 구역만 끈다. 기기 전원은 별도 스위치가 담당한다.
+        heater = device.build_heater_desired(
+            enables={zone: False for zone in zones}
+        )
+        await self.coordinator.async_send(device, {"heater": heater})
 
 
-# -- 보일러 (제어를 켠 NR-6x 만 — v0.24.0 부터 기본 켜짐) ----------------------
+class BoilerThermostat(BoilerEntity, ClimateEntity, RestoreEntity):
+    """보일러 난방 (실내 / 온돌).
 
-# 프리셋 이름 → (기능 Use 이름, operationMode)
-_BOILER_PRESETS = (
-    ("실내난방", "inside", BOILER_MODE_INSIDE),
-    ("온돌난방", "ondol", BOILER_MODE_ONDOL),
-    ("외출", "goout", BOILER_MODE_GOOUT),
-)
+    **기기는 난방 방식을 하나만 켠다.** 실내난방과 온돌난방이 배타적이고 각자
+    다른 설정 온도를 가진다(실내 10~40°C, 온돌 30~65°C). 그래서 `climate` 를
+    둘로 나누지 않고 하나에 `preset` 으로 담는다 — 둘로 나누면 「양쪽 다 켜짐」
+    이라는 불가능한 상태를 표현할 수 있게 되어 오히려 헷갈린다.
 
+    끄기(`OFF`)는 **전원을 끄지 않는다.** `only-hotwater` 를 보내 난방만 쉬고
+    온수는 유지한다 — 룸콘의 「온수전용」이 그것이다. 전원 자체를 끄는 것은
+    전원 스위치가 맡는다.
 
-class BoilerThermostat(BoilerEntity, ClimateEntity):
-    """보일러 난방. 명령은 앱 코드로 확인했고, **NR-6x 두 대에서 실기기로 확인했다**
-    (#20 NR-67D: 온돌 온도 · 전원 / #26 NR-60DS: 실내 · 온돌 · 외출 · 전원, 각 1~2초 안에 반영).
-
-    온도를 바꾸면 그 난방 방식(실내/온돌)의 설정값이 바뀐다 — 앱의 슬라이더와
-    같은 명령이다 (`inside-heat` · `ondol-heat`). 외출 중에 온도를 바꾸면 그
-    난방으로 돌아간다(앱과 같은 명령이라 그렇게 될 것으로 본다 — 확인 전).
-    전원을 다시 켜면 꺼지기 전 모드로 돌아온다 (#26: 외출 → 끔 → 켬 → 외출).
+    모드 전환과 온도 설정이 **같은 명령**이다 (`INNER_HEAT_TEMP_SETTING_REQ` 등).
+    그래서 preset 을 바꿀 때 그 모드의 현재 설정 온도를 함께 보낸다.
     """
 
     _attr_name = "난방"
     _attr_temperature_unit = UnitOfTemperature.CELSIUS
     _attr_hvac_modes = [HVACMode.OFF, HVACMode.HEAT]
+    _attr_supported_features = (
+        ClimateEntityFeature.TARGET_TEMPERATURE
+        | ClimateEntityFeature.PRESET_MODE
+        | ClimateEntityFeature.TURN_ON
+        | ClimateEntityFeature.TURN_OFF
+    )
+    _attr_target_temperature_step = 0.5
+    _attr_precision = 0.5
 
-    def __init__(self, coordinator: NavienSmartCoordinator, boiler: BoilerDevice) -> None:
-        super().__init__(coordinator, boiler)
-        self._attr_unique_id = f"{boiler.device_id}_boiler_thermostat"
-        self._presets = [name for name, use, _ in _BOILER_PRESETS if boiler.supports(use)]
-        features = (
-            ClimateEntityFeature.TARGET_TEMPERATURE
-            | ClimateEntityFeature.TURN_ON
-            | ClimateEntityFeature.TURN_OFF
-        )
-        if self._presets:
-            features |= ClimateEntityFeature.PRESET_MODE
-            self._attr_preset_modes = list(self._presets)
-        self._attr_supported_features = features
+    # preset → (전환 동작, 온도 동작, 상태 필드, 범위 접두사, operationMode 값)
+    #
+    # **전환과 온도가 다른 preset 이 있다.** 실내·온돌은 모드 전환 명령이 곧 온도
+    # 설정 명령이지만(같은 `command`), 외출은 전환이 `goout-on` 이고 온도는 온수
+    # 명령이다 — 외출 중에는 난방을 쉬고 온수만 쓰므로 조절할 것이 그것뿐이다.
+    _PRESETS: dict[str, tuple[str, str, str, str, int]] = {
+        _PRESET_INSIDE: (
+            "inside_temperature",
+            "inside_temperature",
+            "insideTemperatureSetting",
+            "insideTemperature",
+            5,
+        ),
+        _PRESET_ONDOL: (
+            "ondol_temperature",
+            "ondol_temperature",
+            "ondolTemperatureSetting",
+            "ondolTemperature",
+            6,
+        ),
+        _PRESET_AWAY: (
+            # 실측으로 확인된 전환 명령이다 (0x02000004 → operationMode 4).
+            "goout_on",
+            "hot_water_temperature",
+            "hotWaterTemperatureSetting",
+            "hotWaterTemperature",
+            4,
+        ),
+    }
 
-    def _kind(self, boiler: BoilerDevice) -> str | None:
-        """온도를 맞추는 대상 — 지금 모드가 실내면 실내, 온돌이면 온돌.
+    @staticmethod
+    def presets_for(device: BoilerDevice) -> list[str]:
+        """이 기기가 쓸 수 있는 난방 preset. 범위를 모르면 넣지 않는다."""
+        available: list[str] = []
+        if device.supports("insideUse") and device.temperature_range(
+            "insideTemperature"
+        ):
+            available.append(_PRESET_INSIDE)
+        if device.supports("ondolUse") and device.temperature_range("ondolTemperature"):
+            available.append(_PRESET_ONDOL)
+        # 외출은 온수 온도를 조절하므로 온수 범위가 필요하다.
+        if device.supports("gooutUse") and device.temperature_range(
+            "hotWaterTemperature"
+        ):
+            available.append(_PRESET_AWAY)
+        return available
 
-        그 밖의 모드(외출·예약 등)면 온돌을 먼저 본다. #14 · #20 의 NR-67D 처럼
-        실내난방이 없는 기기가 있기 때문이다.
+    def __init__(
+        self, coordinator: NavienSmartCoordinator, device: BoilerDevice
+    ) -> None:
+        super().__init__(coordinator, device)
+        self._attr_unique_id = f"{device.device_id}_climate"
+        self._attr_preset_modes = self.presets_for(device)
+        # 난방을 켜라고만 했을 때 무엇으로 켤지. 지원하는 첫 번째를 쓴다.
+        self._default_preset = self._attr_preset_modes[0]
+        # **꺼져 있을 때 보여줄 값.** 마지막으로 켜져 있던 preset 을 기억한다 —
+        # 전원을 끌 때마다 「실내난방」으로 되돌아가면 온돌을 쓰는 집에서는
+        # 매번 다시 골라야 한다. 아래에서 갱신하고, 재시작 시 복원한다.
+        self._last_preset = self._default_preset
+        # 연속 입력 묶음 (`_DEBOUNCE_SECONDS` 주석). (preset, °C) — 아직 기기가
+        # 확인하지 않은 마지막 입력값이다.
+        self._pending: tuple[str, float] | None = None
+        self._pending_until = 0.0
+        self._flush_unsub: CALLBACK_TYPE | None = None
+
+    async def async_added_to_hass(self) -> None:
+        """재시작 후 마지막 preset 을 되살린다.
+
+        **잠정값이다.** 기기가 상태를 올리면 실제 모드로 덮인다. 아무것도 없는
+        것보다 마지막으로 알던 것이 낫다 — 에어원 상태 복원과 같은 판단이다.
         """
-        mode = boiler.operation_mode
-        if mode == BOILER_MODE_INSIDE and boiler.supports("inside"):
-            return "inside"
-        if mode == BOILER_MODE_ONDOL and boiler.supports("ondol"):
-            return "ondol"
-        if boiler.supports("ondol"):
-            return "ondol"
-        return "inside" if boiler.supports("inside") else None
+        await super().async_added_to_hass()
+        if (last := await self.async_get_last_state()) is None:
+            return
+        stored = last.attributes.get(ATTR_PRESET_MODE)
+        if stored in (self._attr_preset_modes or ()):
+            self._last_preset = stored
 
-    @property
-    def hvac_mode(self) -> HVACMode | None:
-        boiler = self.boiler
-        on = None if boiler is None else boiler.is_on
-        if on is None:
-            return None
-        return HVACMode.HEAT if on else HVACMode.OFF
+    async def async_will_remove_from_hass(self) -> None:
+        """예약해 둔 온도 전송을 취소한다 — 통합을 내릴 때 뒤늦게 나가지 않게."""
+        self._drop_pending()
+        await super().async_will_remove_from_hass()
 
-    @property
-    def hvac_action(self) -> HVACAction | None:
-        boiler = self.boiler
-        if boiler is None or boiler.is_on is None:
-            return None
-        if not boiler.is_on:
-            return HVACAction.OFF
-        if boiler.operation_mode in (BOILER_MODE_INSIDE, BOILER_MODE_ONDOL):
-            return HVACAction.HEATING
-        return HVACAction.IDLE
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        """상태가 올 때마다 **켜져 있는 preset 을 기억한다.**
+
+        `preset_mode` 프로퍼티에서 기록하지 않는다 — 값을 읽는 곳이 상태를
+        바꾸면 HA 가 언제 몇 번 읽는지에 따라 결과가 달라진다.
+
+        기다리던 온도를 기기가 확인해 주면 대기값을 지운다.
+        """
+        device = self.device
+        if device is not None and device.has_status:
+            mode = device.operation_mode
+            for name, (_sw, _tmp, _f, _p, value) in self._PRESETS.items():
+                if mode == value and name in (self._attr_preset_modes or ()):
+                    self._last_preset = name
+                    break
+        if self._pending is not None and self._flush_unsub is None:
+            preset, wanted = self._pending
+            _sw, _tmp, field, _prefix, mode_value = self._PRESETS[preset]
+            confirmed = False
+            if device is not None and device.has_status:
+                raw = device.status.get(field)
+                confirmed = (
+                    device.status.get("operationMode") == mode_value
+                    and raw is not None
+                    and int(raw) == round(wanted * 2)
+                )
+            if confirmed or time.monotonic() > self._pending_until:
+                self._pending = None
+        super()._handle_coordinator_update()
+
+    # -- 지금 무엇을 하고 있는가 -------------------------------------------
 
     @property
     def preset_mode(self) -> str | None:
-        boiler = self.boiler
-        mode = None if boiler is None else boiler.operation_mode
-        name = next((n for n, _, m in _BOILER_PRESETS if m == mode), None)
-        return name if name in self._presets else None
+        """지금 켜져 있는 운전 방식.
+
+        꺼져 있으면 **마지막으로 켜져 있던 것**을 보여준다. 그 값이 목표 온도와
+        범위도 함께 정하므로, 카드가 마지막으로 쓰던 모습 그대로 남는다.
+        """
+        device = self.device
+        if device is None or not device.has_status:
+            return None
+        mode = device.operation_mode
+        for name, (_sw, _tmp, _field, _prefix, value) in self._PRESETS.items():
+            if mode == value:
+                return name
+        return self._last_preset
+
+    @property
+    def hvac_mode(self) -> HVACMode | None:
+        device = self.device
+        if device is None or not device.has_status:
+            return None
+        mode = device.operation_mode
+        if mode is None:
+            return None
+        # 외출(4)도 전원이 켜진 상태다 — preset 으로 구분한다.
+        return HVACMode.OFF if mode == 1 else HVACMode.HEAT
+
+    @property
+    def hvac_action(self) -> HVACAction | None:
+        """실제로 연소 중인가. 설정 온도에 닿으면 모드는 그대로여도 멈춘다."""
+        device = self.device
+        if device is None or not device.has_status:
+            return None
+        if self.hvac_mode is not HVACMode.HEAT:
+            return HVACAction.OFF
+        # **외출 중에는 난방을 하지 않는다.** `operationBusy` 가 2 여도 그것은
+        # 온수를 데우는 것이므로 난방 동작으로 보여주지 않는다.
+        if device.operation_mode == 4:
+            return HVACAction.IDLE
+        running = device.is_running
+        if running is None:
+            return None
+        return HVACAction.HEATING if running else HVACAction.IDLE
 
     @property
     def current_temperature(self) -> float | None:
-        boiler = self.boiler
-        return None if boiler is None else boiler.value("insideTemperature")
+        """현재 실온. **온돌난방일 때도 실온을 보여준다** — 기기가 그것만 준다."""
+        device = self.device
+        if device is None or not device.has_status:
+            return None
+        return device.inside_temperature
 
     @property
     def target_temperature(self) -> float | None:
-        boiler = self.boiler
-        kind = None if boiler is None else self._kind(boiler)
-        return None if kind is None else boiler.value(f"{kind}TemperatureSetting")
-
-    @property
-    def target_temperature_step(self) -> float:
-        boiler = self.boiler
-        return 0.5 if boiler is not None and self._kind(boiler) == "inside" else 1.0
+        device = self.device
+        preset = self.preset_mode
+        if device is None or not device.has_status or preset is None:
+            return None
+        # 아직 기기가 확인하지 않은 마지막 입력이 있으면 그것을 보여준다 —
+        # 응답이 늦게 와서 숫자가 출렁이는 것을 막는다. 시간이 지나면 기기 값으로.
+        if (
+            self._pending is not None
+            and self._pending[0] == preset
+            and time.monotonic() <= self._pending_until
+        ):
+            return self._pending[1]
+        _sw, _tmp, field, _prefix, _value = self._PRESETS[preset]
+        raw = device.status.get(field)
+        return None if raw is None else int(raw) / 2
 
     @property
     def min_temp(self) -> float:
-        boiler = self.boiler
-        kind = None if boiler is None else self._kind(boiler)
-        found = None if kind is None else boiler.temperature_range(kind)
-        return found[0] if found else 10.0
+        return self._bounds()[0]
 
     @property
     def max_temp(self) -> float:
-        boiler = self.boiler
-        kind = None if boiler is None else self._kind(boiler)
-        found = None if kind is None else boiler.temperature_range(kind)
-        return found[1] if found else 85.0
+        return self._bounds()[1]
+
+    def _bounds(self) -> tuple[float, float]:
+        """**preset 에 따라 범위가 바뀐다** (실내 10~40, 온돌 30~65).
+
+        기기가 없거나 범위를 모르면 HA 기본값을 쓴다 — 그 상태에서는 전송이
+        coordinator 에서 막히므로 잘못된 값이 나갈 일은 없다.
+        """
+        device = self.device
+        preset = self.preset_mode
+        if device is not None and preset is not None:
+            _sw, _tmp, _field, prefix, _value = self._PRESETS[preset]
+            if (bounds := device.temperature_range(prefix)) is not None:
+                return bounds
+        return 5.0, 35.0
 
     @property
     def extra_state_attributes(self) -> dict[str, Any] | None:
-        boiler = self.boiler
-        if boiler is None:
+        device = self.device
+        if device is None or not device.has_status:
             return None
-        return {"operation_mode": boiler.mode_name(boiler.operation_mode), "beta": True}
+        attrs: dict[str, Any] = {}
+        if device.operation_mode_name is not None:
+            attrs["boiler_mode"] = device.operation_mode_name
+        # 난방수 온도. 온돌난방에서 실제로 도는 값이라 진단에 유용하다.
+        if device.supply_temperature is not None:
+            attrs["supply_temperature"] = device.supply_temperature
+        if device.return_temperature is not None:
+            attrs["return_temperature"] = device.return_temperature
+        if self._pending is not None:
+            # 보냈거나 보낼 예정이지만 기기가 아직 확인하지 않은 값.
+            attrs["pending_temperature"] = self._pending[1]
+        return attrs or None
 
-    def _require(self) -> BoilerDevice:
-        boiler = self.boiler
-        if boiler is None or not boiler.status:
-            raise HomeAssistantError("보일러 상태를 아직 받지 못했습니다.")
-        return boiler
+    # -- 조작 ---------------------------------------------------------------
 
-    async def async_set_temperature(self, **kwargs: Any) -> None:
-        boiler = self._require()
-        temperature = kwargs.get("temperature")
-        hvac_mode = kwargs.get(ATTR_HVAC_MODE)
-        if hvac_mode == HVACMode.OFF:
-            await self.async_set_hvac_mode(HVACMode.OFF)
-            return
-        if temperature is None:
-            return
-        if not boiler.is_on:
-            # 꺼진 보일러에 난방 명령을 보내면 켜질 수 있다 — 묻지 않고 켜지 않는다.
-            if hvac_mode != HVACMode.HEAT:
-                raise HomeAssistantError("보일러가 꺼져 있습니다. 먼저 켜 주세요.")
-            await self.async_set_hvac_mode(HVACMode.HEAT)
-        kind = self._kind(boiler)
-        if kind is None:
-            raise HomeAssistantError("이 보일러는 실내·온돌 온도 설정을 지원하지 않습니다.")
-        command = BOILER_CMD_INSIDE if kind == "inside" else BOILER_CMD_ONDOL
-        await self.coordinator.async_boiler_control(
-            boiler, command, [boiler.encode(float(temperature))]
-        )
+    @callback
+    def _drop_pending(self) -> None:
+        """대기 중인 온도 입력을 버린다 (예약된 전송도 취소)."""
+        if self._flush_unsub is not None:
+            self._flush_unsub()
+            self._flush_unsub = None
+        self._pending = None
 
     async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
-        boiler = self._require()
-        command = BOILER_CMD_POWER_OFF if hvac_mode == HVACMode.OFF else BOILER_CMD_POWER_ON
-        await self.coordinator.async_boiler_control(boiler, command, [])
+        """`OFF` 는 **전원을 끈다.**
+
+        v0 에서는 `only-hotwater` 를 보내 난방만 쉬게 했다. 외출이 preset 으로
+        들어오면서 그것과 구분이 사라졌다 — 「난방만 끄기」는 이제 preset 을
+        외출로 바꾸는 것이다. `OFF` 는 문자 그대로 전원 끄기로 둔다.
+
+        **대기 중인 온도 입력은 버린다.** 뒤늦게 나간 온도 명령이 방금 고른
+        모드를 되돌리면 안 된다 (실내·온돌은 온도 명령이 곧 모드 전환이다).
+        """
+        self._drop_pending()
+        if hvac_mode is HVACMode.OFF:
+            outcome = await self.coordinator.async_boiler_request("power_off")
+            _raise_if_failed(outcome, "보일러를 끄지 못했습니다")
+            return
+        await self._async_apply(self.preset_mode or self._default_preset, None)
 
     async def async_set_preset_mode(self, preset_mode: str) -> None:
-        boiler = self._require()
-        if preset_mode not in self._presets:
-            raise HomeAssistantError(f"지원하지 않는 모드입니다: {preset_mode}")
-        if preset_mode == "외출":
-            await self.coordinator.async_boiler_control(boiler, BOILER_CMD_GOOUT, [])
+        if preset_mode not in self._PRESETS:
+            raise HomeAssistantError(f"모르는 운전 방식: {preset_mode}")
+        # `async_set_hvac_mode` 와 같은 이유로 대기 중인 온도를 버린다.
+        self._drop_pending()
+        await self._async_apply(preset_mode, None)
+
+    async def async_set_temperature(self, **kwargs: Any) -> None:
+        """온도는 **바로 보내지 않고 묶는다** (`_DEBOUNCE_SECONDS` 주석).
+
+        마지막 입력 뒤 잠깐 기다렸다가 그 값 하나만 보낸다. 그동안 또 누르면
+        기다림을 다시 시작한다.
+        """
+        target = kwargs.get(ATTR_TEMPERATURE)
+        if target is None:
             return
-        # 모드를 바꿀 때는 그 모드의 **지금 설정값**을 그대로 싣는다. 받은 값이
-        # 이미 기기 단위(NR-6x ×2)라 다시 바꾸지 않는다.
-        key, command = (
-            ("insideTemperatureSetting", BOILER_CMD_INSIDE)
-            if preset_mode == "실내난방"
-            else ("ondolTemperatureSetting", BOILER_CMD_ONDOL)
+        preset = (
+            kwargs.get(ATTR_PRESET_MODE) or self.preset_mode or self._default_preset
         )
-        raw = boiler.status.get(key)
-        if not isinstance(raw, (int, float)) or isinstance(raw, bool):
-            raise HomeAssistantError("그 모드의 설정 온도를 아직 받지 못했습니다.")
-        await self.coordinator.async_boiler_control(boiler, command, [float(raw)])
+        if preset not in self._PRESETS:
+            raise HomeAssistantError(f"모르는 운전 방식: {preset}")
+        if self._flush_unsub is not None:
+            self._flush_unsub()
+            self._flush_unsub = None
+        self._pending = (preset, float(target))
+        self._pending_until = (
+            time.monotonic() + _DEBOUNCE_SECONDS + _PENDING_HOLD_SECONDS
+        )
+        self._flush_unsub = async_call_later(
+            self.hass, _DEBOUNCE_SECONDS, self._async_flush_pending
+        )
+        self.async_write_ha_state()
+
+    async def _async_flush_pending(self, _now: Any) -> None:
+        """묶어 둔 마지막 온도를 보낸다.
+
+        서비스 호출은 이미 끝났으므로 실패를 화면 오류로 올릴 수 없다 — 로그에
+        남기고 대기값을 지워 기기 값으로 돌아가게 한다.
+        """
+        self._flush_unsub = None
+        if self._pending is None:
+            return
+        preset, value = self._pending
+        # 기기 확인을 기다리는 시간은 실제로 보낸 시점부터 센다.
+        self._pending_until = time.monotonic() + _PENDING_HOLD_SECONDS
+        try:
+            await self._async_apply(preset, value)
+        except HomeAssistantError as err:
+            _LOGGER.warning(
+                "보일러 %s 온도 %.1f°C 를 보내지 못했습니다: %s", preset, value, err
+            )
+            if self._pending == (preset, value):
+                self._pending = None
+            self.async_write_ha_state()
+
+    async def _async_apply(self, preset: str, temperature: float | None) -> None:
+        """preset 전환과 온도 설정을 보낸다.
+
+        실내·온돌은 **모드 전환 명령이 곧 온도 설정 명령**이라 한 번에 끝난다.
+        **외출은 둘이 다르다** — 전환은 `goout-on`, 온도는 온수 명령이다.
+
+        `temperature` 가 `None` 이면 모드만 바꾼다. 이미 그 모드면 아무것도
+        보내지 않는다 — 같은 명령을 헛되이 쏘지 않는다.
+        """
+        device = self.device
+        if device is None:
+            return
+        switch_action, temp_action, field, _prefix, mode_value = self._PRESETS[preset]
+        already = device.status.get("operationMode") == mode_value
+
+        if temperature is None:
+            if already:
+                return
+            if switch_action == temp_action:
+                # 전환 명령이 온도를 요구한다. 그 모드의 현재 설정값을 그대로 실어
+                # 보낸다 — 모드만 바꾸고 온도는 건드리지 않는 셈이다.
+                outcome = await self.coordinator.async_boiler_request(
+                    switch_action, value=self._current_setting(device, field, preset)
+                )
+            else:
+                outcome = await self.coordinator.async_boiler_request(switch_action)
+            _raise_if_failed(outcome, f"{preset} 으로 바꾸지 못했습니다")
+            return
+
+        # 온도를 바꾼다. 다른 모드였고 전환 명령이 따로면 먼저 전환한다.
+        if not already and switch_action != temp_action:
+            outcome = await self.coordinator.async_boiler_request(switch_action)
+            _raise_if_failed(outcome, f"{preset} 으로 바꾸지 못했습니다")
+
+        outcome = await self.coordinator.async_boiler_request(
+            temp_action, value=temperature
+        )
+        _raise_if_failed(
+            outcome, f"{preset} 온도를 {temperature}°C 로 바꾸지 못했습니다"
+        )
+
+    @staticmethod
+    def _current_setting(device: BoilerDevice, field: str, preset: str) -> float:
+        raw = device.status.get(field)
+        if raw is None:
+            raise HomeAssistantError(
+                f"{preset} 의 현재 설정 온도를 알지 못해 보낼 수 없습니다. "
+                "상태가 채워진 뒤 다시 시도해 주세요"
+            )
+        return int(raw) / 2

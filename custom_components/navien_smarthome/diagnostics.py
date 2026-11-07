@@ -12,8 +12,6 @@
 
 from __future__ import annotations
 
-import re
-import time
 from typing import Any
 
 from homeassistant.components.diagnostics import async_redact_data
@@ -39,19 +37,12 @@ TO_REDACT = {
     "accessToken",
     "refreshToken",
     "accountId",
-    # `deviceId` 뒤 4자. 보일러 요청·응답에 이 키로 실린다 — 8자 미만이라 `_scrub` 의
-    # 값 지우기에 안 걸린다 (#14 제보자 제안, v0.23.1).
-    "additionalValue",
-    # 보일러 `did` 는 대문자 `clientID` 로 온다. 값이 `roomcon-<MAC>` 이다.
-    "boilerControllerSerialNumber",
     "clientId",
-    "clientID",
     "defaultClientId",
     "deviceId",
     "eventId",
     "localIp",
     "mac",
-    "macAddress",
     "mqttTopicKey",
     "nickName",
     "regionCode",
@@ -143,86 +134,16 @@ async def async_get_config_entry_diagnostics(
         "supported_devices": supported,
         # 이 항목이 비어 있지 않으면 이슈에 그대로 붙여 주세요.
         "report_wanted_devices": report_wanted,
-        # 보일러에 상태를 물어본 기록. **응답이 왔는지, 어떤 모양인지**가 지원 여부를
-        # 가른다. 비어 있으면 보일러가 없거나 아직 묻기 전이다.
-        "boiler_probe": _boiler_probe_view(coordinator),
-        # 보일러 베타 (v0.22.0). 해석에 쓴 기능·상태와 보낸 명령. 앱 화면과 대조할 근거.
-        "boilers": _boilers_view(coordinator),
         "out_of_scope_devices": out_of_scope,
     }
     # **키 이름으로 가리는 것만으로는 부족하다.** 값 안에 식별자가 박혀 있는
-    # 경우가 있다 — `requestTopic: "dt/rc/7/A1B2C3D4E5F65678/did"` 가 그것이다.
+    # 경우가 있다 — `requestTopic: "dt/rc/7/1097BD3F5CACB84E/did"` 가 그것이다.
     # `requestTopic` 은 가릴 키 목록에 없었고, 제보자가 이 줄을 공개로 올렸다.
     #
     # 그 키를 목록에 더하는 것으로 끝내지 않는다. **다음에 또 새는 것을 막는다.**
     # 식별자 값을 먼저 모아 두고, 결과 전체에서 그 문자열을 지운다.
     # 토픽 모양(`dt/rc/7/**REDACTED**/did`)은 남으므로 지원을 넓힐 근거는 잃지 않는다.
-    # 보일러 토픽에는 키 없이 실리는 식별자가 셋 더 있다 — `roomcon-<MAC>` 의 MAC
-    # (deviceId 앞 12자), 우리 MQTT clientId, `boiler_probe` 의 deviceId 키.
-    extra = {coordinator.mqtt_client_id}
-    for raw in coordinator.boiler_targets:
-        mac = raw["deviceId"][:12]
-        extra |= {mac, mac.lower(), mac.upper()}
-    secrets = sorted(
-        set(_identifiers(coordinator.raw_devices)) | {v for v in extra if len(v) >= 8},
-        key=len,
-        reverse=True,
-    )
-    return _scrub(payload, secrets)
-
-
-def _boilers_view(coordinator: Any) -> dict[str, Any]:
-    """deviceId 를 키로 쓰지 않는다 (`_boiler_probe_view` 와 같은 이유)."""
-    now = time.monotonic()
-    return {
-        "control_enabled": coordinator.boiler_control_enabled,
-        "stats": dict(coordinator.boiler_stats),
-        "commands": list(coordinator.boiler_commands),
-        "now_at": round(now, 1),
-        "devices": [
-            {
-                "deviceSeq": boiler.raw.get("deviceSeq"),
-                "modelName": boiler.model_name,
-                "modelCode": boiler.model_code,
-                "controllable": coordinator.boiler_controllable(boiler),
-                "last_message_seconds_ago": (
-                    None
-                    if boiler.last_message_at is None
-                    else round(now - boiler.last_message_at, 1)
-                ),
-                "mode": boiler.mode_name(boiler.operation_mode),
-                "feature": async_redact_data(boiler.feature, TO_REDACT),
-                "status": boiler.status,
-                "rooms": {str(k): v for k, v in sorted(boiler.rooms.items())},
-            }
-            for boiler in coordinator.boilers.values()
-        ],
-    }
-
-
-def _boiler_probe_view(coordinator: Any) -> list[dict[str, Any]]:
-    """deviceId 를 키로 쓰지 않는다 — `_scrub` 은 값만 지운다. 목록으로 바꿔 담는다."""
-    models = {
-        raw["deviceId"]: (raw.get("deviceSeq"), raw.get("modelName"), raw.get("modelCode"))
-        for raw in coordinator.boiler_targets
-    }
-    # **기록의 `at` 과 같은 시계로 지금 시각을 남긴다** (v0.21.2). 이게 없어서
-    # 마지막 메시지가 1분 전인지 한 시간 전인지 가릴 수 없었다 — 「기기가 스스로
-    # 올리는가」는 시간 축이 있어야 판단된다.
-    now = round(time.monotonic(), 1)
-    view = []
-    for device_id, record in coordinator.boiler_probe.items():
-        seq, name, code = models.get(device_id, (None, None, None))
-        view.append(
-            {
-                "deviceSeq": seq,
-                "modelName": name,
-                "modelCode": code,
-                "now_at": now,
-                **async_redact_data(record, TO_REDACT),
-            }
-        )
-    return view
+    return _scrub(payload, _identifiers(coordinator.raw_devices))
 
 
 def _identifiers(raw_devices: list[dict[str, Any]]) -> list[str]:
@@ -250,17 +171,10 @@ def _identifiers(raw_devices: list[dict[str, Any]]) -> list[str]:
     return sorted(found, key=len, reverse=True)
 
 
-# **누구 것이든 MQTT 접속 ID 는 지운다** (v0.23.0). 모양은 `{uuid}-U{회원번호}`.
-# 우리 것만 지우고 있었는데, 사용자가 휴대폰 앱을 열면 앱 앞으로 가는 보일러
-# 응답도 우리 구독에 들어와 기록된다 — 그 토픽에 **앱의 접속 ID 와 나비엔 회원번호**가
-# 실려 공개 이슈에 올라갔다 (#20). 값을 미리 알 수 없으니 모양으로 지운다.
-_CLIENT_ID = re.compile(
-    r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}(?:-U\d+)?"
-)
-
-
 def _scrub(value: Any, secrets: list[str]) -> Any:
     """결과 전체를 훑어 식별자 문자열을 지운다."""
+    if not secrets:
+        return value
     if isinstance(value, dict):
         return {key: _scrub(inner, secrets) for key, inner in value.items()}
     if isinstance(value, list):
@@ -269,7 +183,7 @@ def _scrub(value: Any, secrets: list[str]) -> Any:
         for secret in secrets:
             if secret in value:
                 value = value.replace(secret, "**REDACTED**")
-        return _CLIENT_ID.sub("**REDACTED**", value)
+        return value
     return value
 
 

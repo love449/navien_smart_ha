@@ -28,7 +28,6 @@ from .const import (
     LEGACY_CONTROLLER_TO_REQUEST,
     LEGACY_RUNNING_TO_REQUEST,
     API_URL,
-    BOILER_MGPP_MODELS,
     CODE_NOT_AUTHORIZED,
     CODE_SUCCESS,
     CODE_TOKEN_EXPIRED,
@@ -379,8 +378,8 @@ class NavienSmartApi:
     ) -> None:
         """`desired` 를 shadow 로 중계한다.
 
-        `event.modelCode` 는 모든 명령에 붙는다. `beep` 는 여기서 붙이지 않는다 —
-        조작 명령에만 실어야 해서 `coordinator.async_send` 가 고른다.
+        `event.modelCode` 는 모든 명령에 붙는다. `beep` 는 붙이지 않는다 —
+        앱은 2024년 이후 모델에만 붙이고, 없어도 동작하는 것을 실측으로 확인했다.
         """
         session = self._require_session()
         device_seq = device["deviceSeq"]
@@ -453,6 +452,108 @@ class NavienSmartApi:
             raw_body=raw,
         )
 
+    # -- 보일러 ------------------------------------------------------------
+
+    async def async_boiler_request(
+        self,
+        home_seq: int,
+        device_seq: int,
+        service_code: int,
+        request_topic: str,
+        response_topic: str,
+        command: int,
+        mac_address: str,
+        additional_value: str,
+        device_type: int,
+        mqtt_client_id: str,
+        mode: str | None = None,
+        param: list[Any] | None = None,
+        param_str: str = "",
+        dry_run: bool = False,
+    ) -> str:
+        """보일러에 요청을 보낸다. 만든 본문을 그대로 돌려준다.
+
+        **봉투는 앱을 디컴파일해 확정했다** (`BoilerConstants.boilerMGPPMqttPayload`
+        → `GetStatusData.RequestControl`). 추측이 아니다.
+
+            {"serviceCode": 100,
+             "payload": {"protocolVersion": 1,
+                         "sessionID": "<밀리초 epoch>",
+                         "clientID": "mobile-<우리 MQTT clientId>",
+                         "requestTopic": "cmd/20/roomcon-<mac>/status",
+                         "responseTopic": "cmd/20/<mqttTopicKey>/mobile-<clientId>/res",
+                         "request": {"macAddress": "<12자>",
+                                     "registerAt": "<밀리초 epoch>",
+                                     "additionalValue": "<4자>",
+                                     "mode": "inside-heat",
+                                     "param": [],
+                                     "paramStr": "",
+                                     "command": 33554437,
+                                     "deviceType": 20}}}
+
+        **최상위 `topic` 이 없다** — `RequestDataSource.Control` 생성자가
+        `serviceCode` 와 `payload` 만 채운다(APK 확인). 매트와 다른 점이다.
+
+        `command` 는 **전체 정수**다 (`0x01000003` 조회 · `0x02000005` 실내온도 …).
+        `boiler.py` 의 `CMD_*` 상수를 쓸 것.
+
+        `registerAt` 은 기기 등록 시각이 아니라 **현재 밀리초 epoch** 다 —
+        앱이 그렇게 채운다. 헷갈리기 쉬우니 적어 둔다.
+
+        `dry_run` 이면 본문만 만들고 보내지 않는다.
+        """
+        session = self._require_session()
+        now_ms = str(int(time.time() * 1000))
+
+        inner: dict[str, Any] = {
+            "macAddress": mac_address,
+            "registerAt": now_ms,
+            "additionalValue": additional_value,
+            "param": list(param or []),
+            "paramStr": param_str,
+            "command": command,
+            "deviceType": device_type,
+        }
+        if mode is not None:
+            inner["mode"] = mode
+
+        body_obj = {
+            "serviceCode": service_code,
+            "payload": {
+                "protocolVersion": 1,
+                "sessionID": now_ms,
+                "clientID": f"mobile-{mqtt_client_id}",
+                "requestTopic": request_topic,
+                "responseTopic": response_topic,
+                "request": inner,
+            },
+        }
+
+        raw = json.dumps(body_obj, ensure_ascii=False)
+        # 매트·에어원과 같은 이유로 토픽의 '/' 를 '\\/' 로 보낸다.
+        for value in (response_topic, request_topic):
+            quoted = json.dumps(value)
+            raw = raw.replace(quoted, quoted.replace("/", "\\/"))
+
+        if dry_run:
+            _LOGGER.info("보일러 요청 드라이런 (보내지 않았다): %s", raw)
+            return raw
+
+        _LOGGER.debug(
+            "보일러 요청 deviceSeq=%s command=0x%08X mode=%s",
+            device_seq,
+            command,
+            mode,
+        )
+        reply = await self._async_authed_request(
+            "POST",
+            f"/devices/{device_seq}/control",
+            params={"homeSeq": home_seq, "userSeq": session.user_seq},
+            raw_body=raw,
+        )
+        _LOGGER.debug("보일러 요청 서버 응답: %s", reply)
+        return raw
+
     # -- 에어원 ------------------------------------------------------------
 
     async def async_airone_request(
@@ -511,62 +612,6 @@ class NavienSmartApi:
             params={"homeSeq": home_seq, "userSeq": session.user_seq},
             raw_body=raw,
         )
-
-    async def async_boiler_request(
-        self,
-        home_seq: int,
-        device: dict[str, Any],
-        client_id: str,
-        request: tuple[str, str, int],
-        mode: str | None = None,
-        param: list[Any] | None = None,
-    ) -> dict[str, Any]:
-        """보일러 요청을 중계한다. 읽기는 `mode` 없이, 제어는 `mode`·`param` 을 싣는다.
-
-        제어 봉투도 앱과 같다 — `mode` 가 없으면 키를 빼고(Gson 은 null 을 안 쓴다),
-        있으면 `param` 앞에 둔다 (`InternalControlRequest`).
-
-        봉투는 앱 Gson 출력과 같다 (`GetStatusData.RequestControl` /
-        `RequestControlNR35D`). 대문자 `ID` 다 — 에어원의 `clientId` 와 다르다.
-        `deviceId` 앞 12자가 MAC, 뒤 4자가 `additionalValue` 다.
-
-        보낸 본문을 돌려준다. 진단에 남겨 형식이 맞았는지 대조한다.
-        """
-        session = self._require_session()
-        code = device["modelCode"]
-        device_id = device["deviceId"]
-        request_name, response_name, command = request
-        now = str(int(time.time() * 1000))
-        inner: dict[str, Any] = {
-            "macAddress": device_id[:12],
-            "registerAt": now,
-            "additionalValue": device_id[12:16],
-        }
-        if mode is not None:
-            inner["mode"] = mode
-        inner["param"] = list(param or [])
-        payload: dict[str, Any] = {
-            "sessionID": now,
-            "clientID": f"mobile-{client_id}",
-            "requestTopic": f"cmd/{code}/roomcon-{device_id[:12]}/{request_name}",
-            "responseTopic": (
-                f"cmd/{code}/{device.get('mqttTopicKey')}/mobile-{client_id}/{response_name}"
-            ),
-            "request": inner,
-        }
-        if code in BOILER_MGPP_MODELS:
-            payload = {"protocolVersion": 1, **payload}
-            inner.update(paramStr="", command=command, deviceType=int(code))
-
-        body = {"serviceCode": device["serviceCode"], "payload": payload}
-        _LOGGER.debug("보일러 전송 deviceSeq=%s request=%s", device["deviceSeq"], request_name)
-        await self._async_authed_request(
-            "POST",
-            f"/devices/{device['deviceSeq']}/control",
-            params={"homeSeq": home_seq, "userSeq": session.user_seq},
-            raw_body=json.dumps(body, ensure_ascii=False),
-        )
-        return body
 
     async def async_get_air_sensor(
         self, home_seq: int, device_seq: int

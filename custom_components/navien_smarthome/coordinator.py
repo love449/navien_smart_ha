@@ -6,7 +6,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import time
 from datetime import timedelta
@@ -14,9 +13,8 @@ from typing import Any
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
-from homeassistant.exceptions import ConfigEntryAuthFailed, HomeAssistantError
+from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers.debounce import Debouncer
-from homeassistant.helpers.dispatcher import async_dispatcher_send
 from homeassistant.helpers.event import async_call_later
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
@@ -29,7 +27,7 @@ from .api import (
 from homeassistant.helpers.storage import Store
 
 from .airone import AironeDevice, _dig
-from .boiler import BoilerDevice
+from .boiler import COMMAND_STATUS, CONTROL_ACTIONS, BoilerDevice
 from .const import (
     AIRONE_AIR_ERROR_LOG_EVERY,
     AIRONE_CMD_CHANGE_MODE,
@@ -39,27 +37,14 @@ from .const import (
     AIRONE_SILENCE_CHECK_SECONDS,
     AIRONE_TOPIC_FMT,
     AIRONE_UPDATE_INTERVAL_SECONDS,
-    BOILER_CONTROL_MODELS,
-    BOILER_KEEP_FIRST,
-    BOILER_KEEP_MESSAGES,
-    BOILER_MGPP_MODELS,
-    BOILER_NR35_MODELS,
-    BOILER_PREFIX,
-    BOILER_REQ_START,
-    BOILER_REQ_STATUS,
-    BOILER_STALE_SECONDS,
-    BOILER_STATUS_DELAY_SECONDS,
-    CONF_BOILER_CONTROL,
     DOMAIN,
     MIN_REFRESH_COOLDOWN_SECONDS,
-    MODELS_AFTER_2024,
     OUT_OF_SCOPE_REASONS,
     REPORT_WANTED_NOTES,
     REPORT_WANTED_SERVICE_CODES,
     SERVICE_AIRONE,
     SERVICE_BOILER,
     SERVICE_NAMES,
-    SIGNAL_BOILER_READY,
     SUPPORTED_SERVICE_CODES,
     TOPIC_PREFIX,
     UPDATE_INTERVAL_SECONDS,
@@ -68,6 +53,19 @@ from .models import NavienDevice
 from .mqtt import NavienSmartMqtt
 
 _LOGGER = logging.getLogger(__name__)
+
+# **서버가 범위(feature)를 주지 않을 때만 쓰는 대체 범위** (0.5°C 단위 raw).
+#
+# 2026-10 부터 기기목록 REST 의 `Properties.did` 가 null 로 온다. 범위 선언이
+# 사라지면 온도 명령이 전부 막혀 실내난방·온돌난방으로 못 바꿨다. 앱(2.12.2)은
+# 모드를 바꿀 때 범위를 조회하지 않고 현재 설정값을 그대로 다시 보낸다.
+# NR-65D(modelCode 20) 서버 선언값(이슈 #17): 실내 20~80 / 온돌 60~130 / 온수 60~120.
+# 이 범위는 **안전 상한** 일 뿐이다 — 서버가 선언한 값이 있으면 항상 그쪽이 우선한다.
+BOILER_FALLBACK_RANGES: dict[str, tuple[int, int]] = {
+    "insideTemperature": (20, 80),
+    "ondolTemperature": (60, 130),
+    "hotWaterTemperature": (60, 120),
+}
 
 
 def _as_int(value: Any) -> int | None:
@@ -131,6 +129,9 @@ class NavienSmartCoordinator(DataUpdateCoordinator[dict[str, NavienDevice]]):
         # 에어원은 매트와 상태 체계가 달라 같은 dict 에 섞지 않는다. 검증이 끝난
         # 매트 경로를 건드리지 않는 것이 우선이다.
         self.airone: dict[str, AironeDevice] = {}
+        # 보일러도 별도 dict — 세 번째 체계다. **관찰 전용**: 상태를 받아 보여줄
+        # 뿐 명령도 상태 요청도 보내지 않는다 (boiler.py 모듈 주석 참조).
+        self.boiler: dict[str, BoilerDevice] = {}
         # 구세대는 `remote/status` 요청에 답하지 않는다. 마지막으로 받은 상태를
         # 남겨 두었다가 시작할 때 되살린다 — 그러지 않으면 첫 조작 전까지
         # 전원·모드·풍량이 모두 비어 보인다.
@@ -140,21 +141,13 @@ class NavienSmartCoordinator(DataUpdateCoordinator[dict[str, NavienDevice]]):
         self.restored_devices: set[str] = set()
         # 「상태가 안 온다」와 「와도 못 붙인다」를 진단만으로 가리기 위한 집계.
         # 개인정보는 없다 — 개수와 키 이름뿐이다.
-        self.drop_counts: dict[str, int] = {"mate_no_device": 0, "airone_no_device": 0}
+        self.drop_counts: dict[str, int] = {
+            "mate_no_device": 0,
+            "airone_no_device": 0,
+            "boiler_no_device": 0,
+        }
         self._mqtt: NavienSmartMqtt | None = None
         self._skipped_logged: set[str] = set()
-        # 보일러 상태 수집 기록. deviceId 별로 보낸 것과 받은 것을 시각과 함께 남긴다.
-        # 엔티티는 없다 — 진단 파일로 지원 여부를 판단하려는 것이다.
-        self.boiler_probe: dict[str, dict[str, list[dict[str, Any]]]] = {}
-        # 설치(재시작)당 한 번만 묻는다. MQTT 가 다시 붙을 때마다 묻지 않는다.
-        self._boiler_probed = False
-        # 보일러 베타 (v0.22.0). 기기목록에 상태가 없어 MQTT 응답에서 채운다.
-        self.boilers: dict[str, BoilerDevice] = {}
-        # 오래 조용해서 다시 물은 시각. 답이 없어도 폴링마다 묻지 않게 한다.
-        self._boiler_asked_at: dict[str, float] = {}
-        # 진단용 집계 — 개수와 보낸 명령(모드·값)뿐이다. 식별자는 없다.
-        self.boiler_stats: dict[str, int] = {"polls": 0, "control_fail": 0}
-        self.boiler_commands: list[dict[str, Any]] = []
         # **폴링이 돌기는 하는지**를 남긴다.
         #
         # 이슈 #1 에서 공기질 값이 열 시간 동안 그대로였는데, 조회 실패도 빈 응답도
@@ -218,6 +211,9 @@ class NavienSmartCoordinator(DataUpdateCoordinator[dict[str, NavienDevice]]):
         previous_airone = self.airone
         airone: dict[str, AironeDevice] = {}
 
+        previous_boiler = self.boiler
+        boiler: dict[str, BoilerDevice] = {}
+
         for raw in raw_devices:
             # **항목이 dict 가 아닐 수 있다.** 그때 `.get` 을 부르면
             # `AttributeError` 가 나고, 우리 예외가 아니라 갱신이 조용히 멈춘다.
@@ -230,6 +226,15 @@ class NavienSmartCoordinator(DataUpdateCoordinator[dict[str, NavienDevice]]):
             # 매트는 정수로 오는 것을 확인했다. 에어원도 그럴 거라 단정하지 않는다 —
             # 문자열로 오면 비교가 조용히 실패해 기기가 통째로 사라진다.
             service_code = _as_int(raw.get("serviceCode"))
+            if service_code == SERVICE_BOILER:
+                parsed_boiler = self._parse_boiler(raw, previous_boiler)
+                if parsed_boiler is not None:
+                    boiler[parsed_boiler.device_id] = parsed_boiler
+                    continue
+                # 해석하지 못한 보일러는 기존 제보 요청 경로로 보낸다.
+                self.unsupported.append(raw)
+                self._log_unsupported(raw)
+                continue
             if service_code not in SUPPORTED_SERVICE_CODES:
                 self.unsupported.append(raw)
                 self._log_unsupported(raw)
@@ -277,23 +282,33 @@ class NavienSmartCoordinator(DataUpdateCoordinator[dict[str, NavienDevice]]):
             devices[device.device_id] = device
 
         self.airone = airone
-
-        previous_boilers = self.boilers
-        boilers: dict[str, BoilerDevice] = {}
-        for raw in self.boiler_targets:
-            boiler = BoilerDevice(raw)
-            if (old := previous_boilers.get(boiler.device_id)) is not None:
-                boiler.carry_over(old)
-            boilers[boiler.device_id] = boiler
-        self.boilers = boilers
-        self._ask_quiet_boilers()
-
+        self.boiler = boiler
         self._tune_interval()
         await self._async_update_air_sensors()
+        await self._async_refresh_boiler_status()
         self.poll_stamp = time.monotonic()
         self.poll_failures = 0
         self.poll_last_error = None
         return devices
+
+    async def _async_refresh_boiler_status(self) -> None:
+        """폴링마다 보일러에 상태를 물어본다.
+
+        **자발 보고를 보조하는 것이다.** 기기는 실온이 0.5°C 움직일 때만 스스로
+        올린다(실측) — 여름에는 몇 시간씩 조용할 수 있다. 그동안 값이 멈춰
+        보이는 것을 막는다.
+
+        조회는 값을 싣지 않아 설정을 바꾸지 않는다. MQTT 가 아직 안 붙었으면
+        응답 토픽을 만들 수 없으므로 조용히 건너뛴다 — 붙은 직후
+        `_async_request_initial_state` 가 한 번 더 부른다.
+        """
+        if not self.boiler or self._mqtt is None or not self._mqtt.connected:
+            return
+        try:
+            await self.async_boiler_request("status")
+        except NavienSmartError as err:
+            # 폴링을 실패로 만들지 않는다 — 기기목록은 이미 읽었다.
+            _LOGGER.debug("보일러 상태 요청 실패: %s", err)
 
     def _tune_interval(self) -> None:
         """에어원이 있으면 폴링을 짧게 한다.
@@ -370,6 +385,43 @@ class NavienSmartCoordinator(DataUpdateCoordinator[dict[str, NavienDevice]]):
 
         self._log_airone_found(device)
         return device
+
+    def _parse_boiler(
+        self, raw: dict[str, Any], previous: dict[str, BoilerDevice]
+    ) -> BoilerDevice | None:
+        """보일러 하나를 해석한다. 만들 수 없으면 이유를 로그에 남긴다."""
+        device = BoilerDevice.parse(raw)
+        if device is None:
+            self._log_skip(
+                raw,
+                "응답에 deviceSeq·serviceCode 가 없어 보일러를 만들지 못했습니다 "
+                f"(Properties 구조: {_key_map(raw)})",
+            )
+            return None
+
+        # 이미 받아둔 상태와 기록을 잃지 않는다 — 매트·에어원과 같은 이유다.
+        if (old := previous.get(device.device_id)) is not None:
+            device.status = old.status
+            device.status_stamp = old.status_stamp
+            device.state_log = old.state_log
+
+        self._log_boiler_found(device)
+        return device
+
+    def _log_boiler_found(self, device: BoilerDevice) -> None:
+        """보일러를 찾았다는 것을 한 번만 알린다. **관찰 전용임을 분명히 한다.**"""
+        key = f"{device.device_seq}:boiler_found"
+        if key in self._skipped_logged:
+            return
+        self._skipped_logged.add(key)
+        _LOGGER.info(
+            "보일러를 찾았습니다 (%s, modelName=%s). **관찰 전용**으로 붙습니다 — "
+            "다른 클라이언트(앱·SmartThings)가 조회할 때 오는 상태를 보여줄 뿐, "
+            "이 통합이 명령이나 상태 요청을 보내지는 않습니다. 상태가 오래 비어 "
+            "있으면 그 때문입니다. 값이 앱과 다르면 통계정보와 함께 제보해 주세요.",
+            device.nickname,
+            device.model_name,
+        )
 
     def _log_airone_found(self, device: AironeDevice) -> None:
         """에어원을 찾았다는 것을 한 번만 알린다.
@@ -471,15 +523,6 @@ class NavienSmartCoordinator(DataUpdateCoordinator[dict[str, NavienDevice]]):
         self._skipped_logged.add(key)
         name = SERVICE_NAMES.get(service_code, f"serviceCode {service_code}")
 
-        if raw in self.boiler_targets:
-            _LOGGER.info(
-                "%s (modelName=%s) 를 베타로 연결합니다 — 상태 보기. "
-                "NR-6x 는 제어도 됩니다 (통합 설정의 '보일러 제어 사용').",
-                name,
-                raw.get("modelName"),
-            )
-            return
-
         if service_code in REPORT_WANTED_SERVICE_CODES:
             _LOGGER.warning(
                 "%s 를 찾았습니다 (modelName=%s). 아직 지원하지 않습니다 — %s. "
@@ -563,8 +606,8 @@ class NavienSmartCoordinator(DataUpdateCoordinator[dict[str, NavienDevice]]):
         }
         if self.airone and (prefix := TOPIC_PREFIX.get(SERVICE_AIRONE)):
             prefixes.add(prefix)
-        if self.boiler_targets:
-            prefixes.add(BOILER_PREFIX)
+        if self.boiler and (prefix := TOPIC_PREFIX.get(SERVICE_BOILER)):
+            prefixes.add(prefix)
         if not prefixes:
             _LOGGER.debug("구독할 기기가 없어 MQTT 를 시작하지 않습니다")
             return
@@ -579,7 +622,7 @@ class NavienSmartCoordinator(DataUpdateCoordinator[dict[str, NavienDevice]]):
             on_reported=self._handle_reported,
             on_subscribed=self._async_request_initial_state,
             on_airone_reported=self._handle_airone_reported,
-            on_boiler_message=self._handle_boiler_message,
+            on_boiler_reported=self._handle_boiler_reported,
         )
         await self._mqtt.async_start()
 
@@ -630,180 +673,21 @@ class NavienSmartCoordinator(DataUpdateCoordinator[dict[str, NavienDevice]]):
                 continue
             self._schedule_airone_silence_check(airone)
 
-        if self.boiler_targets and not self._boiler_probed:
-            self._boiler_probed = True
-            # 기다리는 동안 MQTT 재접속 감시를 막지 않도록 따로 돌린다.
-            self.hass.async_create_background_task(
-                self._async_probe_boilers(), name="navien_smart_boiler_probe"
-            )
-
-    # -- 보일러 상태 수집 --------------------------------------------------
-
-    @property
-    def boiler_targets(self) -> list[dict[str, Any]]:
-        """상태를 물어볼 보일러. 요청 형식을 아는 modelCode 만."""
-        return [
-            raw
-            for raw in self.raw_devices
-            if raw.get("serviceCode") == SERVICE_BOILER
-            and raw.get("modelCode") in BOILER_MGPP_MODELS | BOILER_NR35_MODELS
-            and len(raw.get("deviceId") or "") >= 16
-        ]
-
-    def _boiler_record(self, device_id: str) -> dict[str, list[dict[str, Any]]]:
-        return self.boiler_probe.setdefault(
-            device_id, {"sent": [], "first": [], "received": []}
-        )
-
-    async def _async_probe_boilers(self) -> None:
-        """앱이 보일러 화면을 열 때와 같은 읽기 요청 두 개를 보낸다."""
-        for request, pause in (
-            (BOILER_REQ_START, BOILER_STATUS_DELAY_SECONDS),
-            (BOILER_REQ_STATUS, 0),
-        ):
-            for raw in self.boiler_targets:
-                entry: dict[str, Any] = {
-                    "request": request[0],
-                    "at": round(time.monotonic(), 1),
-                }
-                client_id = self._mqtt.client_id if self._mqtt is not None else ""
-                try:
-                    entry["body"] = await self.api.async_boiler_request(
-                        self.home_seq, raw, client_id, request
-                    )
-                    entry["result"] = "ok"
-                except NavienSmartError as err:
-                    entry["result"] = f"{type(err).__name__}: {err}"
-                    _LOGGER.debug("보일러 %s 요청 실패: %s", request[0], err)
-                self._boiler_record(raw["deviceId"])["sent"].append(entry)
-            if pause:
-                await asyncio.sleep(pause)
-
-    @callback
-    def _handle_boiler_message(self, topic: str, body: Any) -> None:
-        """받은 그대로 남긴다. 어느 보일러 것인지는 토픽의 deviceId 로 가른다."""
-        device_id = next(
-            (raw["deviceId"] for raw in self.boiler_targets if raw["deviceId"] in topic),
-            "unknown",
-        )
-        record = self._boiler_record(device_id)
-        message = {"at": round(time.monotonic(), 1), "topic": topic, "body": body}
-        if len(record["first"]) < BOILER_KEEP_FIRST:
-            record["first"].append(message)
-        else:
-            received = record["received"]
-            received.append(message)
-            del received[:-BOILER_KEEP_MESSAGES]
-        self._apply_boiler_message(device_id, body)
-
-    @callback
-    def _apply_boiler_message(self, device_id: str, body: Any) -> None:
-        """응답에 든 기능·상태를 반영한다. 봉투는 `{topic, payload: {response}}`."""
-        boiler = self.boilers.get(device_id)
-        if boiler is None or not isinstance(body, dict):
-            return
-        if str(body.get("topic") or "").endswith("controlfail"):
-            self.boiler_stats["control_fail"] += 1
-            _LOGGER.warning("%s 가 명령을 거절했습니다 (controlfail)", boiler.nickname)
-        payload = body.get("payload")
-        response = payload.get("response") if isinstance(payload, dict) else None
-        if not isinstance(response, dict):
-            return
-        if boiler.apply_response(response):
-            # 무엇을 지원하는지 이제 안다. 플랫폼이 엔티티를 더한다.
-            async_dispatcher_send(
-                self.hass,
-                SIGNAL_BOILER_READY.format(self.config_entry.entry_id),
-                device_id,
-            )
-        self._async_push_update(self.data or {})
-
-    def _ask_quiet_boilers(self) -> None:
-        """오래 조용한 보일러에만 상태를 묻는다.
-
-        상태가 바뀌면 보일러가 스스로 보낸다 (#20). 그래서 폴링마다 묻지 않고,
-        `BOILER_STALE_SECONDS` 동안 아무것도 안 온 보일러에만 한 번 묻는다.
-        처음 붙을 때는 `_async_probe_boilers` 가 묻는다.
-        """
-        if not self._boiler_probed or not self.mqtt_connected:
-            return
-        now = time.monotonic()
-        for boiler in self.boilers.values():
-            last = max(
-                boiler.last_message_at or 0.0,
-                self._boiler_asked_at.get(boiler.device_id, 0.0),
-            )
-            if now - last < BOILER_STALE_SECONDS:
-                continue
-            self._boiler_asked_at[boiler.device_id] = now
-            self.boiler_stats["polls"] += 1
-            self.hass.async_create_background_task(
-                self._async_ask_boiler(boiler), name="navien_smart_boiler_status"
-            )
-
-    async def _async_ask_boiler(self, boiler: BoilerDevice) -> None:
-        """기능 목록이 없으면 start 부터, 있으면 status 만 묻는다."""
-        requests = [BOILER_REQ_STATUS] if boiler.feature else [BOILER_REQ_START, BOILER_REQ_STATUS]
-        for index, request in enumerate(requests):
-            if index:
-                await asyncio.sleep(BOILER_STATUS_DELAY_SECONDS)
+        # **보일러도 상태를 물어본다.**
+        #
+        # 자발 보고는 실온이 0.5°C 움직일 때만 온다(실측). 그래서 재시작 직후
+        # 엔티티가 전부 `알 수 없음` 으로 남고, 계절에 따라 몇 시간씩 그대로다.
+        # 조회는 값을 싣지 않아 **설정을 바꾸지 않는다** — 매트·에어원과 같다.
+        if self.boiler:
             try:
-                await self.api.async_boiler_request(
-                    self.home_seq, boiler.raw, self.mqtt_client_id, request
-                )
+                await self.async_boiler_request("status")
             except NavienSmartError as err:
-                _LOGGER.debug("%s 상태 요청 실패: %s", boiler.nickname, err)
-                return
-
-    # -- 보일러 제어 ---------------------------------------------------------
-
-    @property
-    def boiler_control_enabled(self) -> bool:
-        """통합 설정의 「보일러 제어 사용」. **기본은 켜짐** (v0.24.0).
-
-        v0.22.0~v0.23.0 은 실험이라 기본으로 꺼 두었다. NR-6x 두 대(#20 NR-67D ·
-        #26 NR-60DS)에서 전원 · 실내 · 온돌 · 외출 · 온수가 모두 확인돼 기본을 바꿨다.
-        직접 끈 사람(False 로 저장)은 그대로 꺼져 있다. 제어 대상은 여전히
-        `BOILER_CONTROL_MODELS` 뿐이다.
-        """
-        return bool(self.config_entry.options.get(CONF_BOILER_CONTROL, True))
-
-    def boiler_controllable(self, boiler: BoilerDevice) -> bool:
-        return self.boiler_control_enabled and boiler.model_code in BOILER_CONTROL_MODELS
-
-    async def async_boiler_control(
-        self, boiler: BoilerDevice, command: tuple[str, int], param: list[Any]
-    ) -> None:
-        """명령 하나를 보낸다. 결과는 보일러가 보내는 상태 방송으로 돌아온다."""
-        if not self.boiler_controllable(boiler):
-            raise HomeAssistantError(
-                "보일러 제어가 꺼져 있습니다. 통합 설정의 '보일러 제어 사용' 을 켜 주세요."
-            )
-        mode, code = command
-        self.boiler_commands.append(
-            {"at": round(time.monotonic(), 1), "mode": mode, "param": list(param)}
-        )
-        del self.boiler_commands[:-BOILER_KEEP_MESSAGES]
-        try:
-            await self.api.async_boiler_request(
-                self.home_seq,
-                boiler.raw,
-                self.mqtt_client_id,
-                ("control", "res", code),
-                mode=mode,
-                param=param,
-            )
-        except NavienSmartError as err:
-            raise HomeAssistantError(f"보일러에 명령을 보내지 못했습니다: {err}") from err
+                _LOGGER.debug("보일러 초기 상태 요청 실패: %s", err)
 
     async def async_stop_mqtt(self) -> None:
         if self._mqtt is not None:
             await self._mqtt.async_stop()
             self._mqtt = None
-
-    @property
-    def mqtt_client_id(self) -> str:
-        return self._mqtt.client_id if self._mqtt is not None else ""
 
     @property
     def mqtt_connected(self) -> bool:
@@ -871,6 +755,36 @@ class NavienSmartCoordinator(DataUpdateCoordinator[dict[str, NavienDevice]]):
         # 기기가 실제로 올린 값이 왔으니 더 이상 복원값이 아니다.
         self.restored_devices.discard(device.device_id)
         self._async_remember_state()
+        self._async_push_update(self.data or {})
+
+    @callback
+    def _handle_boiler_reported(self, device_key: str, status: dict[str, Any]) -> None:
+        """보일러 상태를 반영한다. HA 이벤트 루프에서 불린다.
+
+        토픽 끝 조각(mac+부가값)과 기기목록 식별자를 대조한다. 못 찾았는데
+        보일러가 **한 대뿐이면 그 기기로 본다** — 기기목록의 식별자 표기가
+        토픽과 다른 사례를 배제할 근거가 없고, 한 대뿐이면 오배정될 대상이 없다.
+        폴백을 쓴 사실은 한 번 로그로 남겨 제보로 가릴 수 있게 한다.
+        """
+        device = next(
+            (d for d in self.boiler.values() if d.matches(device_key)), None
+        )
+        if device is None and len(self.boiler) == 1:
+            device = next(iter(self.boiler.values()))
+            key = f"{device.device_seq}:boiler_key_fallback"
+            if key not in self._skipped_logged:
+                self._skipped_logged.add(key)
+                _LOGGER.info(
+                    "보일러 상태의 기기 식별자가 기기목록과 달라 단일 기기 폴백을 "
+                    "썼습니다 (topic 끝=%s). 동작에는 문제가 없지만 이 로그를 "
+                    "제보해 주시면 대조 규칙을 정확히 할 수 있습니다.",
+                    device_key,
+                )
+        if device is None:
+            self.drop_counts["boiler_no_device"] += 1
+            _LOGGER.debug("모르는 보일러의 보고 무시: %s", device_key)
+            return
+        device.apply_status(status)
         self._async_push_update(self.data or {})
 
     @callback
@@ -1058,6 +972,161 @@ class NavienSmartCoordinator(DataUpdateCoordinator[dict[str, NavienDevice]]):
 
         async_call_later(self.hass, AIRONE_READBACK_DELAY_SECONDS, _readback)
 
+    async def async_boiler_request(
+        self,
+        action: str = "status",
+        value: float | None = None,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        """보일러에 조회 또는 제어 요청을 보낸다.
+
+        봉투는 앱을 디컴파일해 확정한 것이다 (`api.async_boiler_request` 주석).
+
+        `action` 이 `"status"` 면 조회다 — **값을 싣지 않으므로 아무 설정도
+        바뀌지 않는다.** 그 밖의 값은 `boiler.CONTROL_ACTIONS` 의 키다.
+
+        온도를 바꾸는 동작은 `value` 를 섭씨로 받는다. **서버 메타데이터의 범위로
+        검증한 뒤** 0.5°C 단위 정수로 바꿔 보낸다 — 가스 기기다.
+        """
+        results: list[dict[str, Any]] = []
+        mqtt_client_id = self._mqtt.client_id if self._mqtt is not None else ""
+
+        for device in self.boiler.values():
+            outcome: dict[str, Any] = {"device": device.nickname, "action": action}
+
+            if action == "status":
+                command, mode, field = COMMAND_STATUS, None, None
+            elif action in CONTROL_ACTIONS:
+                command, mode, field = CONTROL_ACTIONS[action]
+            else:
+                outcome |= {"sent": False, "reason": f"모르는 동작: {action}"}
+                results.append(outcome)
+                continue
+
+            request_topic = device.request_topic(
+                "status" if action == "status" else "control"
+            )
+            response_topic = device.response_topic(mqtt_client_id)
+            if request_topic is None or response_topic is None:
+                outcome |= {
+                    "sent": False,
+                    "reason": (
+                        "요청·응답 토픽을 만들 수 없습니다 "
+                        f"(mqttTopicKey={'있음' if device.mqtt_topic_key else '없음'}, "
+                        f"mac={'있음' if device.mac_address else '없음'}, "
+                        f"mqtt={'연결' if mqtt_client_id else '미연결'})"
+                    ),
+                }
+                results.append(outcome)
+                continue
+
+            param: list[Any] = []
+            if field is not None:
+                if value is None:
+                    outcome |= {"sent": False, "reason": "이 동작은 value 가 필요합니다"}
+                    results.append(outcome)
+                    continue
+                raw_value = self._boiler_temperature_value(device, field, value)
+                if raw_value is None:
+                    outcome |= {
+                        "sent": False,
+                        "reason": (
+                            f"{value}°C 는 서버가 알려준 범위를 벗어납니다 — "
+                            "보내지 않습니다"
+                        ),
+                    }
+                    results.append(outcome)
+                    continue
+                # 구세대 프로토콜이 값을 마지막 자리에 실었다. 앱 `param` 도
+                # 같은 자리로 보이지만 **확인되지 않았다** — 실패하면 이 부분이다.
+                param = [raw_value]
+                outcome["raw_value"] = raw_value
+
+            try:
+                body = await self.api.async_boiler_request(
+                    self.home_seq,
+                    device_seq=device.device_seq,
+                    service_code=device.service_code,
+                    request_topic=request_topic,
+                    response_topic=response_topic,
+                    command=command,
+                    mac_address=device.mac_address or "",
+                    additional_value=device.additional_value or "",
+                    device_type=device.device_type or 20,
+                    mqtt_client_id=mqtt_client_id,
+                    mode=mode,
+                    param=param,
+                    dry_run=dry_run,
+                )
+            except NavienSmartAuthError as err:
+                raise ConfigEntryAuthFailed(str(err)) from err
+            except NavienSmartError as err:
+                _LOGGER.warning("%s 요청 실패 (%s): %s", device.nickname, action, err)
+                outcome |= {"sent": False, "reason": str(err)}
+                results.append(outcome)
+                continue
+
+            outcome |= {"sent": not dry_run, "command": f"0x{command:08X}", "body": body}
+            results.append(outcome)
+
+        return {"results": results}
+
+    def _boiler_temperature_value(
+        self, device: BoilerDevice, field: str, celsius: float
+    ) -> int | None:
+        """섭씨를 0.5°C 단위 정수로. **서버 범위를 벗어나면 `None`.**
+
+        범위는 기기 원본의 능력 메타데이터에서 읽는다 (`insideTemperatureMin` 등).
+        서버 선언이 없으면 `BOILER_FALLBACK_RANGES`(NR-65D 서버 선언값)로 검사한다 —
+        범위 검사 자체를 없애지는 않는다. 가스 기기다.
+        """
+        prefix = {
+            "insideTemperatureSetting": "insideTemperature",
+            "ondolTemperatureSetting": "ondolTemperature",
+            "hotWaterTemperatureSetting": "hotWaterTemperature",
+        }.get(field)
+        if prefix is None:
+            return None
+
+        # 1순위: 기기목록의 능력 선언. 2순위: MQTT `start` 응답으로 받아 둔 feature
+        # (`device.feature`, 없으면 건너뜀). 둘 다 없으면 3순위 대체 범위.
+        feature = _dig(device.raw, "Properties", "did", "response", "feature") or {}
+        if not feature:
+            feature = getattr(device, "feature", None) or {}
+        low = _as_int(feature.get(f"{prefix}Min"))
+        high = _as_int(feature.get(f"{prefix}Max"))
+        if low is None or high is None:
+            low, high = BOILER_FALLBACK_RANGES[prefix]
+            key = f"{device.device_seq}:{prefix}:fallback_range"
+            if key not in self._skipped_logged:
+                self._skipped_logged.add(key)
+                _LOGGER.info(
+                    "%s 의 %s 범위를 서버가 알려주지 않아 대체 범위(%s~%s = "
+                    "%.1f~%.1f°C)로 검사합니다. 서버가 선언한 값이 오면 그쪽이 "
+                    "우선합니다",
+                    device.nickname,
+                    prefix,
+                    low,
+                    high,
+                    low / 2,
+                    high / 2,
+                )
+
+        raw_value = round(celsius * 2)
+        if not low <= raw_value <= high:
+            _LOGGER.warning(
+                "%s: %s 가 범위를 벗어납니다 (%s, 허용 %s~%s = %.1f~%.1f°C)",
+                device.nickname,
+                celsius,
+                raw_value,
+                low,
+                high,
+                low / 2,
+                high / 2,
+            )
+            return None
+        return raw_value
+
     async def async_send(self, device: NavienDevice, desired: dict[str, Any]) -> None:
         """명령을 보낸 뒤 낙관적 갱신은 하지 않는다.
 
@@ -1067,10 +1136,6 @@ class NavienSmartCoordinator(DataUpdateCoordinator[dict[str, NavienDevice]]):
         # 무엇을 보냈는지 남긴다. 냉방은 「보낸 값이 그대로 돌아오는가」를 봐야
         # 닫히는 구간이라 이 기록이 근거가 된다.
         device.note_command(desired)
-        # 앱과 같이 2024년 이후 모델에만 싣는다 (이슈 #23). 빈 초기 요청에는 싣지
-        # 않는다 — HA 가 시작할 때마다 매트가 울린다.
-        if int(device.model_code) in MODELS_AFTER_2024:
-            desired = {**desired, "beep": True}
         try:
             await self.api.async_control(self.home_seq, device.raw, desired)
         except NavienSmartAuthError as err:

@@ -1,8 +1,6 @@
 {
-  "name": "Navien Smart",
+  "name": "Navien Smart (개인 수정본)",
   "content_in_root": false,
   "render_readme": true,
-  "homeassistant": "2025.2.0",
-  "zip_release": true,
-  "filename": "navien_smarthome.zip"
+  "homeassistant": "2025.2.0"
 }

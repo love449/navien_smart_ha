@@ -27,7 +27,6 @@ from homeassistant.util.ssl import get_default_context
 
 from .api import AwsCredentials
 from .const import (
-    BOILER_PREFIX,
     IOT_ENDPOINT,
     IOT_REGION,
     IOT_SERVICE,
@@ -52,6 +51,10 @@ _RECONNECT_DELAYS = (5, 15, 30, 60, 120, 300)
 # 에어원 메시지를 매트 메시지와 가르는 기준. 앱도 구독 토픽 문자열로 판별한다
 # (`HomeViewModel` 의 `/airone/#` / `/mate/#` 분기).
 AIRONE_PREFIX = "airone"
+
+# 보일러(스마트톡) 메시지 판별 기준. 봉투가 매트·에어원과 또 다르다 —
+# `extract_boiler_status` 와 boiler.py 모듈 주석 참조. **수신 전용**이다.
+BOILER_PREFIX = "smarttok"
 
 
 def _uri_encode(value: str) -> str:
@@ -213,6 +216,49 @@ def extract_airone_reported(
     return device_id, reported
 
 
+def extract_boiler_status(
+    payload: bytes, topic: str, stats: dict[str, Any] | None = None
+) -> tuple[str, dict[str, Any]] | None:
+    """보일러(스마트톡) 응답에서 `status` 를 꺼낸다.
+
+    봉투가 매트(shadow)·에어원과 또 다르다 — NR-65D 실측 (boiler.py 모듈 주석 참조).
+    `{payload: {response: {macAddress, additionalValue, status: {...}}}}` 다.
+
+    반환은 `(device_key, status)`. `device_key` 는 토픽 끝 조각(mac+부가값)을
+    먼저 쓰고, 없으면 응답 안의 mac+부가값으로 만든다.
+
+    `connected` 토픽(payload `{}`)과 요청 접수류 프레임은 `status` 가 없어
+    여기서 걸러진다 — 집계만 남긴다.
+    """
+    try:
+        event = json.loads(payload)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        _LOGGER.debug("JSON 이 아닌 보일러 메시지 무시: topic=%s", topic)
+        _bump(stats, "dropped_not_json")
+        return None
+    if not isinstance(event, dict):
+        _bump(stats, "dropped_not_json")
+        return None
+
+    inner = event.get("payload")
+    response = inner.get("response") if isinstance(inner, dict) else None
+    status = response.get("status") if isinstance(response, dict) else None
+    if not isinstance(status, dict):
+        _bump(stats, "dropped_no_status")
+        return None
+
+    device_key = topic.rsplit("/", 1)[-1]
+    if not device_key or device_key == BOILER_PREFIX:
+        mac = str(response.get("macAddress") or "")
+        extra = str(response.get("additionalValue") or "")
+        device_key = f"{mac}{extra}"
+    if not device_key:
+        _bump(stats, "dropped_no_device_id")
+        return None
+    _bump(stats, "accepted")
+    return device_key, status
+
+
 def normalize_legacy_status(payload: dict[str, Any]) -> dict[str, Any] | None:
     """구세대 평평한 상태 프레임을 신형 `reported` 모양으로 옮긴다.
 
@@ -278,7 +324,7 @@ class NavienSmartMqtt:
         on_reported: Callable[[str, dict[str, Any]], None],
         on_subscribed: Callable[[], Awaitable[None]] | None = None,
         on_airone_reported: Callable[[str, dict[str, Any]], None] | None = None,
-        on_boiler_message: Callable[[str, Any], None] | None = None,
+        on_boiler_reported: Callable[[str, dict[str, Any]], None] | None = None,
     ) -> None:
         self._hass = hass
         # 수신·폐기 집계. 개인정보는 없다 — 개수와 키 이름뿐이다.
@@ -289,7 +335,7 @@ class NavienSmartMqtt:
         self._credentials_provider = credentials_provider
         self._on_reported = on_reported
         self._on_airone_reported = on_airone_reported
-        self._on_boiler_message = on_boiler_message
+        self._on_boiler_reported = on_boiler_reported
         # 구독이 붙은 뒤에 초기 상태를 요청해야 한다. 순서가 뒤바뀌면 응답을 놓친다.
         self._on_subscribed = on_subscribed
         self._client_id = ""
@@ -298,12 +344,26 @@ class NavienSmartMqtt:
         self._stopping = False
         self._attempt = 0
         self.connected = False
+        # SUBACK 대조용 — mid → topic. AWS IoT 는 정책 위반 구독을 SUBACK 으로만 알린다.
+        self._sub_mids: dict[int, str] = {}
 
     @property
     def topics(self) -> list[str]:
         # 앱과 같은 `#` 를 쓴다 (`HomeViewModel` 이 `/{prefix}/#` 로 구독한다).
         # 에어원 응답이 한 단계 더 깊게 올 수 있어 `+` 로는 놓친다.
-        return [f"{self._home_seq}/{prefix}/#" for prefix in sorted(self._prefixes)]
+        # 기기 명령 토픽(`cmd/20/roomcon-*/#`)은 구독하지 않는다 — SUBACK 은
+        # 승인되지만 메시지가 배달되지 않는 것을 실측했다 (AWS IoT 는
+        # iot:Subscribe 와 iot:Receive 를 따로 평가한다). 재시도 불필요.
+        topics = [f"{self._home_seq}/{prefix}/#" for prefix in sorted(self._prefixes)]
+        if BOILER_PREFIX in self._prefixes and self._client_id:
+            # **우리 이름으로 된 응답 토픽.** 보일러 상태 요청 일곱 가지가 모두
+            # 서버 200 을 받고도 응답이 없었다. 응답이 `responseTopic` 으로만
+            # 가고 우리가 그것을 듣지 않는 것인지 가른다.
+            #
+            # 기기 토픽과 달리 **자기 clientId 로 된 토픽은 AWS IoT 정책이
+            # 보통 허용한다.** SUBACK 이 그것까지 함께 알려준다.
+            topics.append(f"cmd/20/{self._client_id}/control/res")
+        return topics
 
     @property
     def client_id(self) -> str:
@@ -408,6 +468,7 @@ class NavienSmartMqtt:
         client.on_connect = self._on_connect
         client.on_disconnect = self._on_disconnect
         client.on_message = self._on_message
+        client.on_subscribe = self._suback
         # `ssl.create_default_context()` 는 인증서를 디스크에서 읽어 이벤트 루프를
         # 막는다. HA 가 부팅 때 만들어 캐시해 둔 컨텍스트를 쓴다.
         client.tls_set_context(get_default_context())
@@ -430,8 +491,18 @@ class NavienSmartMqtt:
             return
         self.connected = True
         for topic in self.topics:
-            client.subscribe(topic, qos=0)
+            _result, mid = client.subscribe(topic, qos=0)
+            self._sub_mids[mid] = topic
         _LOGGER.debug("MQTT 구독 시작: %s", ", ".join(self.topics))
+
+    def _suback(
+        self, _client: Any, _userdata: Any, mid: int, reason_codes: Any, *_args: Any
+    ) -> None:
+        # SUBACK 확인. 128(0x80)이면 브로커(정책)가 그 구독을 거부한 것이다.
+        # paho 1.x 는 granted_qos, 2.x 는 ReasonCode 목록을 준다 — 둘 다 그대로 찍는다.
+        # 주의: 이름을 `_on_subscribe` 로 하지 말 것 — 기존 `_on_subscribed` 와
+        # 부분 문자열로 겹쳐 grep/패치 스크립트가 오탐한다 (실제로 겪었다).
+        _LOGGER.debug("SUBACK %s -> %s", self._sub_mids.pop(mid, mid), reason_codes)
 
     def _on_disconnect(self, _client: Any, _userdata: Any, *args: Any) -> None:
         self.connected = False
@@ -444,17 +515,9 @@ class NavienSmartMqtt:
             _bump(self.stats, "airone_received")
             self._handle_airone_message(message)
             return
-        if f"/{BOILER_PREFIX}/" in message.topic:
-            # 보일러는 해석하지 않는다. 모양을 모르므로 받은 그대로 넘겨 진단에 담는다.
-            _bump(self.stats, "boiler_received")
-            if self._on_boiler_message is not None:
-                try:
-                    body: Any = json.loads(message.payload)
-                except (TypeError, ValueError):
-                    body = repr(message.payload[:500])
-                self._hass.loop.call_soon_threadsafe(
-                    self._on_boiler_message, message.topic, body
-                )
+
+        if f"/{BOILER_PREFIX}/" in message.topic or message.topic.startswith("cmd/"):
+            self._handle_boiler_message(message)
             return
 
         _bump(self.stats, "mate_received")
@@ -473,6 +536,33 @@ class NavienSmartMqtt:
         )
         # paho 스레드에서 HA 상태를 직접 건드리면 안 된다.
         self._hass.loop.call_soon_threadsafe(self._on_reported, device_id, reported)
+
+    def _handle_boiler_message(self, message: Any) -> None:
+        """보일러 메시지. 파싱해 넘기되, raw 도 DEBUG 로 남긴다.
+
+        아직 실측이 NR-65D 한 대뿐이라 다른 컨트롤러의 봉투가 다를 수 있다.
+        raw 로그가 있어야 파서가 버린 프레임을 제보로 가릴 수 있다.
+        값 전체가 로그에 남으므로 이슈에 붙일 때는 개인정보를 확인할 것.
+        """
+        _bump(self.stats, "boiler_received")
+        _LOGGER.debug(
+            "BOILER RAW %s | %s",
+            message.topic,
+            message.payload.decode("utf-8", errors="replace"),
+        )
+        if self._on_boiler_reported is None:
+            _bump(self.stats, "boiler_dropped_no_handler")
+            return
+        boiler_stats: dict[str, Any] = {}
+        result = extract_boiler_status(message.payload, message.topic, boiler_stats)
+        for key in boiler_stats:
+            _bump(self.stats, f"boiler_{key}")
+        if result is None:
+            return
+        device_key, status = result
+        self._hass.loop.call_soon_threadsafe(
+            self._on_boiler_reported, device_key, status
+        )
 
     def _handle_airone_message(self, message: Any) -> None:
         if self._on_airone_reported is None:

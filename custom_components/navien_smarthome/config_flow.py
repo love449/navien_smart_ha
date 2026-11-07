@@ -11,18 +11,12 @@ from typing import Any
 
 import voluptuous as vol
 
-from homeassistant.config_entries import (
-    ConfigEntry,
-    ConfigFlow,
-    ConfigFlowResult,
-    OptionsFlow,
-)
+from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
 from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
-from homeassistant.core import callback
 from homeassistant.helpers.aiohttp_client import async_create_clientsession
 
 from .api import NavienSmartApi, NavienSmartAuthError, NavienSmartError
-from .const import CONF_BOILER_CONTROL, CONF_HOME_SEQ, DOMAIN
+from .const import CONF_HOME_SEQ, DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -35,11 +29,6 @@ class NavienSmartConfigFlow(ConfigFlow, domain=DOMAIN):
     """아이디/비밀번호 → (필요하면) home 선택."""
 
     VERSION = 1
-
-    @staticmethod
-    @callback
-    def async_get_options_flow(config_entry: ConfigEntry) -> OptionsFlow:
-        return NavienSmartOptionsFlow()
 
     def __init__(self) -> None:
         self._username: str | None = None
@@ -144,21 +133,4 @@ class NavienSmartConfigFlow(ConfigFlow, domain=DOMAIN):
                 CONF_PASSWORD: self._password,
                 CONF_HOME_SEQ: int(home["homeSeq"]),
             },
-        )
-
-
-class NavienSmartOptionsFlow(OptionsFlow):
-    """「보일러 제어 사용」 하나 (기본 켜짐). 바꾸면 통합이 다시 불러와진다 (`__init__` 의 리스너)."""
-
-    async def async_step_init(
-        self, user_input: dict[str, Any] | None = None
-    ) -> ConfigFlowResult:
-        if user_input is not None:
-            return self.async_create_entry(data=user_input)
-        current = bool(self.config_entry.options.get(CONF_BOILER_CONTROL, True))
-        return self.async_show_form(
-            step_id="init",
-            data_schema=vol.Schema(
-                {vol.Optional(CONF_BOILER_CONTROL, default=current): bool}
-            ),
         )
